@@ -165,7 +165,7 @@ async fn main() -> ExitCode {
     match _main(&args).await {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
-            diagnostics::ConsoleDiagnostics.inside(PathBuf::new()).diagnose(e);
+            diagnostics::ConsoleDiagnostics.diagnose(e);
             ExitCode::FAILURE
         },
     }

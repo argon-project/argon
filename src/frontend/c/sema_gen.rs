@@ -397,24 +397,24 @@ fn evaluatePreprocessorExpression<S: Source>(
     // ),
     match ast.kind() {
         "identifier" => {
-            let key = ast.string(source)?;
+            let key = ast.str(source)?;
 
             Ok(config
                 .preprocessor_defines
-                .get(&key)
+                .get(key.as_ref())
                 .map_or_else(|| 0, |&v| v))
         }
         "call_expression" => {
             debug!("preprocessor call expr not supported, evaluating to false");
             Ok(0)
         }
-        "number_literal" => isize::from_str(&ast.string(source)?)
+        "number_literal" => isize::from_str(&ast.str(source)?.as_ref())
             .map_err(|e| ReportMessage::InvalidNumberLiteral(e).at(ast.range())),
         "char_literal" => {
             let mut value: isize = 0;
             let mut iter = ast.walk();
             for char in ast.named_children(&mut iter) {
-                let c = char::from_str(&char.string(source)?)
+                let c = char::from_str(&char.str(source)?.as_ref())
                     .map_err(|e| ReportMessage::InvalidCharacterLiteral(e).at(ast.range()))?;
                 value += c as u32 as isize;
             }
@@ -428,7 +428,7 @@ fn evaluatePreprocessorExpression<S: Source>(
 
             Ok(config
                 .preprocessor_defines
-                .contains_key(&identifier.string(source)?)
+                .contains_key(identifier.str(source)?.as_ref())
                 .into())
         }
         "unary_expression" => {
@@ -686,7 +686,8 @@ pub fn gen_sema<S: Source, R: Recorder<E>, E>(
 
                 match path.kind() {
                     "system_lib_string" => {
-                        let s = path.string(source)?;
+                        let _s = path.str(source)?;
+                        let s = _s.as_ref();
                         _ = recorder.record_include(IncludedHeader::system(s[1..s.len() - 1].into()));
                     }
                     "string_literal" => {
@@ -816,9 +817,9 @@ pub fn symbolizeMacroDefintion<S: Source, R: Recorder<E>, E>(
     let name = ast
         .child_by_field_name("name")
         .ok_or(ReportMessage::PreprocessorMissingIdentifier.at(ast.range()))?
-        .string(source)?;
+        .str(source)?;
 
-    if config.ingore_header_guard_defines && name.ends_with("_H") {
+    if config.ingore_header_guard_defines && name.as_ref().ends_with("_H") {
         debug!("ignoring header guard definition");
         return Ok(());
     }
@@ -828,7 +829,7 @@ pub fn symbolizeMacroDefintion<S: Source, R: Recorder<E>, E>(
     if let Some(params) = ast.child_by_field_name("parameters") {
         let mut iter = params.walk();
         for child in params.children(&mut iter) {
-            let s = child.string(source)?;
+            let s = child.str(source)?;
             if child.is_named() {
                 let true = child.kind() == "identifier" else {
                     // error!(
@@ -843,9 +844,9 @@ pub fn symbolizeMacroDefintion<S: Source, R: Recorder<E>, E>(
                     continue;
                 };
 
-                parameters.push(Parameter::regular(s));
+                parameters.push(Parameter::regular(s.to_string()));
             } else {
-                let true = s == "..." else {
+                let true = s.as_ref() == "..." else {
                     // error!(
                     //     "<preproc_params has unknown child '{}' {}",
                     //     child.kind(),
@@ -864,7 +865,7 @@ pub fn symbolizeMacroDefintion<S: Source, R: Recorder<E>, E>(
     }
 
     _ = recorder.record_symbol(Symbol::macroDefintion(MacroDefinition {
-        name: name,
+        name: name.to_string(),
         parameters: parameters,
         value: ast
             .child_by_field_name("value")
@@ -905,8 +906,8 @@ pub fn symbolsInDecl<S: Source, R: Recorder<E>, E>(
 
     if isTypeDefinition {
         if let Some(first) = ast.child(0) {
-            if let Ok(name) = first.string(source) {
-                if name == "__extension__" {
+            if let Ok(name) = first.str(source) {
+                if name.as_ref() == "__extension__" {
                     declarationQualifiers.push(DeclarationQualifier::extension);
                 }
             }
@@ -965,11 +966,11 @@ pub fn symbolsInDecl<S: Source, R: Recorder<E>, E>(
 
             match name {
                 "storage_class_specifier" => {
-                    let Ok(s) = child.string(source) else {
+                    let Ok(s) = child.str(source) else {
                         continue;
                     };
 
-                    let Ok(storage) = Storage::from_str(&s) else {
+                    let Ok(storage) = Storage::from_str(s.as_ref()) else {
                         debug!("could not create modifier from <storage_class_specifier>");
                         continue;
                     };
@@ -1337,11 +1338,11 @@ fn symbolFromDeclarator<S: Source>(
                             return None;
                         };
 
-                        let Ok(name) = c.string(source) else {
+                        let Ok(name) = c.str(source) else {
                             return None;
                         };
 
-                        return MSPointerModifier::from_ast_name(&name);
+                        return MSPointerModifier::from_ast_name(name.as_ref());
                     })
                     .collect();
 
