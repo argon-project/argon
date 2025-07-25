@@ -1,0 +1,172 @@
+use log::{
+    debug
+};
+use clap::{
+    Parser
+};
+use semver::Op;
+use thiserror;
+use simple_logger::SimpleLogger;
+use std::{
+    borrow::Cow, fs, io::{self, IsTerminal, Read}, path::{
+        Path, PathBuf
+    }, process::ExitCode, str::FromStr, vec
+};
+use json5;
+use encoding::{self, Encoding};
+use argon::compiler::{
+        diagnostics::{
+            self, DiagnosticReporter, FileAttachableDiagnostic, FileDiagnosticsExtension, LocatedDiagnostic, LocationAttachableDiagnostic
+        },
+        strings
+    };
+
+#[derive(Debug, thiserror::Error)]
+enum CLIError {
+    #[error("No config file path specified and neither of doc.json or [doc|docs|Documentation]/doc.json exist")]
+    MissingConfigFile,
+
+    #[error("Manifest could not be transcoded from UTF-16 to UTF-8, {0}. The UTF-8 mandate is a limitation of the json5 parser.")]
+    ManifestTranscodingFailure(Cow<'static, str>),
+
+    #[error("Manifest does not represent valid UTF-8, {0}.")]
+    ManifestEncodingError(#[from] std::str::Utf8Error),
+
+    #[error("Manifest could not be parsed, {0}")]
+    JSONParsingFailed(#[from] json5::Error),
+
+    #[error("Specified manifest version {0} is not supported by this compiler.")]
+    UnsupportedManifestVersion(semver::Version),
+
+    #[error("Manifest not readable, {0}")]
+    UnreadableManifest(io::Error),
+
+    #[error(transparent)]
+    ManifestError(#[from] Box<diagnostics::FileDiagnostic<Self, json5::Location>>),
+}
+
+impl diagnostics::Diagnostic<json5::Location> for CLIError {
+    fn location(&self) -> Option<json5::Location> {
+        match self {
+            Self::JSONParsingFailed(e) => e.location(),
+            _ => None
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Arguments {
+    #[arg(long, default_value_t = true)]
+    debug: bool,
+
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    #[arg(long, default_value_t = strings::Encoding::UTF8)]
+    manifest_encoding: strings::Encoding,
+}
+
+fn try_well_known_config_paths() -> Option<PathBuf> {
+    debug!("No config file specified, looking at known locations");
+    let paths: [&Path; 4] = [
+        "doc.json", 
+        "doc/doc.json", 
+        "docs/doc.json", 
+        "Documentation/doc.json"
+    ].map(|p| Path::new(p));
+
+    paths.iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_path_buf())
+}
+
+fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> {
+    let mut stdin = io::stdin();
+    if file.is_none() && !stdin.is_terminal() {
+        let mut buffer: Vec<u8> = vec![];
+        if stdin.read_to_end(&mut buffer).is_ok() {
+            if !buffer.is_empty() {
+                debug!("Using stdin as config file");
+                return Ok((buffer, PathBuf::from_str("stdin").unwrap()))
+            }
+        }
+    }
+
+    let config_file = file
+        .or_else(try_well_known_config_paths)
+        .ok_or(CLIError::MissingConfigFile)?;
+
+    debug!("Using config file at {}", config_file.display());
+
+    fs::read(config_file.as_path())
+        .map_err(|e| CLIError::UnreadableManifest(e))
+        .map(|data| (data, config_file))
+}
+
+fn parse_manifest(data: Vec<u8>, args: &Arguments) -> Result<argon::driver::manifest::v1::DocManifest, CLIError> {
+    let transcoded: Option<String> = match args.manifest_encoding {
+        strings::Encoding::UTF8 => None,
+        strings::Encoding::UTF16(strings::Endianness::LittleEndian) => {
+            Some(encoding::all::UTF_16LE.decode(&data, encoding::DecoderTrap::Strict)
+                .map_err(|e| CLIError::ManifestTranscodingFailure(e))?)
+        },
+        strings::Encoding::UTF16(strings::Endianness::BigEndian) => {
+            Some(encoding::all::UTF_16BE.decode(&data, encoding::DecoderTrap::Strict)
+                .map_err(|e| CLIError::ManifestTranscodingFailure(e))?)
+        },
+    };
+
+    let str: &str = match args.manifest_encoding {
+        strings::Encoding::UTF8 => str::from_utf8(&data)?,
+        strings::Encoding::UTF16(_) => &transcoded.expect("Bug!"),
+    };
+
+    let preparsed_manifest: argon::driver::manifest::PreparsedManifest = json5::from_str(str)?;
+
+    if preparsed_manifest.version.major != 1 {
+        return Err(CLIError::UnsupportedManifestVersion(preparsed_manifest.version))
+    }
+
+    let manifest: argon::driver::manifest::v1::DocManifest = json5::from_str(str)?;
+
+    Ok(manifest)
+}
+
+async fn _main(args: &Arguments) -> Result<(), CLIError> {
+    let (manifest, manifest_path) = read_manifest(args.manifest.clone())?;
+
+    let d = CLIError::JSONParsingFailed(json5::Error::Message { msg: "hh".to_string(), location: Some(json5::Location { line: 0, column: 0 }) }).at(diagnostics::Location {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: diagnostics::Point { row: 0, column: 0, },
+                end_point: diagnostics::Point { row: 0, column: 0, },
+            }).inside(PathBuf::new());
+
+    let manifest = parse_manifest(manifest, args)
+        .map_err(|e| CLIError::ManifestError(Box::new(e.inside(manifest_path))))?;
+
+    println!("{:?}", manifest);
+
+        // let mut tasks = JoinSet::new();
+    // tasks.join_all().await;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = Arguments::parse();
+
+    if args.debug {
+        SimpleLogger::new().init().unwrap();
+    }
+
+    match _main(&args).await {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            diagnostics::ConsoleDiagnostics.inside(PathBuf::new()).diagnose(e);
+            ExitCode::FAILURE
+        },
+    }
+}
