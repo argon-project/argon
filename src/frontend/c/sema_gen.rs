@@ -1,7 +1,3 @@
-#![allow(non_snake_case)]
-#![allow(non_camel_case_types)]
-#![allow(non_upper_case_globals)]
-
 use super::sema::{
     Array, ArrayQualifier, AttachedExpression, Attribute, CType, Container,
     DeclarationQualifier, Enum, EnumCase, Expression, Function, FunctionQualifier, Identifier,
@@ -11,17 +7,17 @@ use super::sema::{
     TypeQualifier, Variable,
 };
 
-use crate::{compiler::{
-    diagnostics::{
-        self, Diagnostic, DiagnosticReporter, LocatedDiagnostic, LocationAttachableDiagnostic
-    }, strings::Source
-}, frontend::c};
+use crate::{
+    compiler::{
+        diagnostics::{
+            self, Diagnostic, DiagnosticReporter, LocatedDiagnostic, LocationAttachableDiagnostic
+        }, strings::Source
+    }
+};
 
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::{error, fmt};
-use clap::builder::Str;
-use serde::de;
 use strum_macros::Display;
 use log::{
     debug, 
@@ -331,48 +327,48 @@ impl fmt::Display for _Range {
 }
 
 fn args_from_ast<S: Source>(
-    argumentList: Node,
+    argument_list: Node,
     source: S,
 ) -> Result<Vec<RawSpelling>, SemaGenError<S::StrError>> {
-    argumentList
-        .named_children(&mut argumentList.walk())
+    argument_list
+        .named_children(&mut argument_list.walk())
         .map(|s| s.string(source))
         .collect()
 }
 
-#[derive(Display)]
-pub enum SemaGenError1<SourceError: error::Error> {
-    readingFromSourceFailed(SourceError),
-    languageError,
-    declMissingType,
-    unknownPrimitiveType,
-    unsupportedCType,
-    unnamedEmptyType,
-    missingTypeQualifierChild,
-    missingInnerDeclarator,
-    duplicateInitializer,
-    missingValue,
-    standardAttributeMissingIdentifier,
-    missingIdentifier,
-    missingArgumentList,
-    missingOperator,
-    missingOperand,
-    weirdFunctionParameter,
-    unsupportedFunctionParameterDecl,
-    unknownDeclarator,
-    unknownDeclQualifier,
-    corruptedArgumentList,
-    unknownBinaryOperator,
-    unknownUnaryOperator,
-    unknownPreprocessorExpr,
-    invalidNumberLiteral(<usize as FromStr>::Err),
-    invalidCharacterLiteral(<char as FromStr>::Err),
-    missingDirective,
-    missingCondition,
-    missingAlternative,
-    parserInconsistency,
-    parsingFailed,
-}
+// #[derive(Display)]
+// pub enum SemaGenError1<SourceError: error::Error> {
+//     readingFromSourceFailed(SourceError),
+//     languageError,
+//     declMissingType,
+//     unknownPrimitiveType,
+//     unsupportedCType,
+//     unnamedEmptyType,
+//     missingTypeQualifierChild,
+//     missingInnerDeclarator,
+//     duplicateInitializer,
+//     missingValue,
+//     standardAttributeMissingIdentifier,
+//     missingIdentifier,
+//     missingArgumentList,
+//     missingOperator,
+//     missingOperand,
+//     weirdFunctionParameter,
+//     unsupportedFunctionParameterDecl,
+//     unknownDeclarator,
+//     unknownDeclQualifier,
+//     corruptedArgumentList,
+//     unknownBinaryOperator,
+//     unknownUnaryOperator,
+//     unknownPreprocessorExpr,
+//     invalidNumberLiteral(<usize as FromStr>::Err),
+//     invalidCharacterLiteral(<char as FromStr>::Err),
+//     missingDirective,
+//     missingCondition,
+//     missingAlternative,
+//     parserInconsistency,
+//     parsingFailed,
+// }
 
 // impl<SourceError: error::Error> From<SourceError> for SemaGenError<SourceError> {
 //     fn from(e: SourceError) -> Self {
