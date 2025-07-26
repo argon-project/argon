@@ -1,16 +1,42 @@
 use serde::{
     Deserialize,
-    Serialize
+    Serialize,
+    Deserializer,
+    de
 };
+use std::fmt;
+use lenient_semver::{self, VersionBuilder};
+use semver::Version;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct PreparsedManifest {
-    pub version: semver::Version,
+    #[serde(deserialize_with = "deserialize_lenient_version")]
+    pub version: Version,
+}
+
+fn deserialize_lenient_version<'de, D: Deserializer<'de>>(
+    deserializer: D
+) -> Result<Version, D::Error> {
+    struct VersionVisitor;
+
+    impl<'de> de::Visitor<'de> for VersionVisitor {
+        type Value = Version;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("semver version")
+        }
+
+        fn visit_str<E: de::Error>(self, string: &str) -> Result<Self::Value, E> {
+            lenient_semver::parse(string).map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_str(VersionVisitor)
 }
 
 pub fn supported_manifest_versions() -> Vec<semver::Version> {
     vec![
-        semver::Version::parse("1.0.0").unwrap()
+        Version::parse("1.0.0").unwrap()
     ]
 }
 

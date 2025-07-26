@@ -4,7 +4,6 @@ use log::{
 use clap::{
     Parser
 };
-use semver::Op;
 use thiserror;
 use simple_logger::SimpleLogger;
 use std::{
@@ -16,7 +15,7 @@ use json5;
 use encoding::{self, Encoding};
 use argon::compiler::{
         diagnostics::{
-            self, DiagnosticReporter, FileAttachableDiagnostic, FileDiagnosticsExtension, LocatedDiagnostic, LocationAttachableDiagnostic
+            self, DiagnosticReporter, FileAttachableDiagnostic
         },
         strings
     };
@@ -40,9 +39,6 @@ enum CLIError {
 
     #[error("Manifest not readable, {0}")]
     UnreadableManifest(io::Error),
-
-    #[error(transparent)]
-    ManifestError(#[from] Box<diagnostics::FileDiagnostic<Self, json5::Location>>),
 }
 
 impl diagnostics::Diagnostic<json5::Location> for CLIError {
@@ -104,7 +100,7 @@ fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> 
         .map(|data| (data, config_file))
 }
 
-fn parse_manifest(data: Vec<u8>, args: &Arguments) -> Result<argon::driver::manifest::v1::DocManifest, CLIError> {
+fn parse_manifest(data: &[u8], args: &Arguments) -> Result<argon::driver::manifest::v1::DocManifest, CLIError> {
     let transcoded: Option<String> = match args.manifest_encoding {
         strings::Encoding::UTF8 => None,
         strings::Encoding::UTF16(strings::Endianness::LittleEndian) => {
@@ -133,27 +129,6 @@ fn parse_manifest(data: Vec<u8>, args: &Arguments) -> Result<argon::driver::mani
     Ok(manifest)
 }
 
-async fn _main(args: &Arguments) -> Result<(), CLIError> {
-    let (manifest, manifest_path) = read_manifest(args.manifest.clone())?;
-
-    let d = CLIError::JSONParsingFailed(json5::Error::Message { msg: "hh".to_string(), location: Some(json5::Location { line: 0, column: 0 }) }).at(diagnostics::Location {
-                start_byte: 0,
-                end_byte: 0,
-                start_point: diagnostics::Point { row: 0, column: 0, },
-                end_point: diagnostics::Point { row: 0, column: 0, },
-            }).inside(PathBuf::new());
-
-    let manifest = parse_manifest(manifest, args)
-        .map_err(|e| CLIError::ManifestError(Box::new(e.inside(manifest_path))))?;
-
-    println!("{:?}", manifest);
-
-        // let mut tasks = JoinSet::new();
-    // tasks.join_all().await;
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Arguments::parse();
@@ -162,11 +137,25 @@ async fn main() -> ExitCode {
         SimpleLogger::new().init().unwrap();
     }
 
-    match _main(&args).await {
-        Ok(_) => ExitCode::SUCCESS,
+    let diags = diagnostics::ConsoleDiagnostics;
+
+    let (manifest, manifest_path) = match read_manifest(args.manifest.clone()) {
+        Ok(x) => x,
         Err(e) => {
-            diagnostics::ConsoleDiagnostics.diagnose(e);
-            ExitCode::FAILURE
+            diags.diagnose(e);
+            return ExitCode::FAILURE
         },
-    }
+    };
+
+    let manifest = match parse_manifest(&manifest, &args) {
+            Ok(m) => m,
+            Err(e) => {
+                diags.diagnose(e.inside(manifest_path));
+                return ExitCode::FAILURE
+            },
+        };
+
+    println!("{:?}", manifest);
+
+    ExitCode::SUCCESS
 }
