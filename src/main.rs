@@ -79,7 +79,7 @@ fn try_well_known_config_paths() -> Option<PathBuf> {
 
 fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> {
     let mut stdin = io::stdin();
-    if file.is_none() && !stdin.is_terminal() {
+    if (file.is_none() && !stdin.is_terminal()) || file.as_ref().map(|f| f.as_os_str() == "<stdin>") == Some(true) {
         let mut buffer: Vec<u8> = vec![];
         if stdin.read_to_end(&mut buffer).is_ok() {
             if !buffer.is_empty() {
