@@ -1,3 +1,11 @@
+use serde::{
+    Deserialize, 
+    Serialize,
+    de,
+    Deserializer,
+    Serializer
+};
+use std::fmt;
 use tree_sitter;
 use std::ops::Range;
 use std::str::{
@@ -29,17 +37,58 @@ pub enum Encoding {
     UTF16(Endianness),
 }
 
+impl Default for Encoding {
+    fn default() -> Self {
+        Self::UTF8
+    }
+}
+
+impl<'de> Deserialize<'de> for Encoding {
+    fn deserialize<D>(deserializer: D) -> Result<Encoding, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EncodingVisitor;
+
+        impl<'de> de::Visitor<'de> for EncodingVisitor {
+            type Value = Encoding;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("semver version")
+            }
+
+            fn visit_str<E>(self, string: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Encoding::from_str(string).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(EncodingVisitor)
+    }
+}
+
+impl Serialize for Encoding {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 pub struct EncodingStrUnknown;
 
 impl FromStr for Encoding {
-    type Err = &'static str;
+    type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "UTF8" | "utf8" | "UTF-8" | "utf-8" => Ok(Self::UTF8),
             "UTF16" | "utf16" | "UTF-16" | "utf-16" => Ok(Self::UTF16(Endianness::system())),
             "UTF16LE" | "utf16le" | "UTF-16le" | "utf-16le" => Ok(Self::UTF16(Endianness::LittleEndian)),
             "UTF16BE" | "utf16be" | "UTF-16be" | "utf-16be" => Ok(Self::UTF16(Endianness::BigEndian)),
-            _ => Err("Unknown encoding")
+            _ => Err(format!("Unknown encoding '{}'", s))
         }
     }
 }

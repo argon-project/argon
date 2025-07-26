@@ -15,7 +15,7 @@ use json5;
 use encoding::{self, Encoding};
 use argon::compiler::{
         diagnostics::{
-            self, DiagnosticReporter, FileAttachableDiagnostic
+            self, DiagnosticReporter, FileAttachableDiagnostic, FileDiagnosticsExtension
         },
         strings
     };
@@ -37,8 +37,8 @@ enum CLIError {
     #[error("Specified manifest version {0} is not supported by this compiler.")]
     UnsupportedManifestVersion(semver::Version),
 
-    #[error("Manifest not readable, {0}")]
-    UnreadableManifest(io::Error),
+    #[error("Manifest at {0} is not readable, {1}")]
+    UnreadableManifest(PathBuf, io::Error),
 }
 
 impl diagnostics::Diagnostic<json5::Location> for CLIError {
@@ -84,7 +84,7 @@ fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> 
         if stdin.read_to_end(&mut buffer).is_ok() {
             if !buffer.is_empty() {
                 debug!("Using stdin as config file");
-                return Ok((buffer, PathBuf::from_str("stdin").unwrap()))
+                return Ok((buffer, PathBuf::from_str("<stdin>").unwrap()))
             }
         }
     }
@@ -96,7 +96,7 @@ fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> 
     debug!("Using config file at {}", config_file.display());
 
     fs::read(config_file.as_path())
-        .map_err(|e| CLIError::UnreadableManifest(e))
+        .map_err(|e| CLIError::UnreadableManifest(config_file.clone(), e))
         .map(|data| (data, config_file))
 }
 
@@ -154,6 +154,10 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE
             },
         };
+
+    if !manifest.proofread(&diags.inside(manifest_path)) {
+        return ExitCode::FAILURE;
+    }
 
     println!("{:?}", manifest);
 

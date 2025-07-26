@@ -103,22 +103,14 @@ impl diagnostics::Diagnostic for TargetError {
 }
 
 impl Target {
-    async fn ingest(
+    async fn compile(
         &self, 
         tasks: &mut JoinSet<Result<(), ()>>, 
         graph: Arc<Mutex<ir::EntryGraph>>,
         config: Arc<Config>,
         diags: &impl DiagnosticReporter
-    ) -> Result<(), TargetError> {
-        match self.dialect {
-            ir::Dialect::Doxygen => {},
-            dialect => {
-                return Err(TargetError::UnsupportedDialect(
-                    dialect, 
-                    self.name.clone()
-                ));
-            }
-        }
+    ) -> Result<usize, TargetError> {
+        
 
         let base = config.base_path
             .to_str()
@@ -175,6 +167,6 @@ impl Target {
             });
         }
 
-        Ok(())
+        Ok(0)
     }
 }
