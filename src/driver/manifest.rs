@@ -58,17 +58,46 @@ pub mod v1 {
         Serialize
     };
     use crate::{
-        backend, compiler::{diagnostics::{self, DiagnosticReporter}, strings}, ir
+        driver,
+        ir,
+        backend,
+        
+        compiler::{
+            diagnostics::{
+                self, 
+                DiagnosticReporter
+            }, 
+            strings
+        }, 
     };
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DocManifest {
     pub targets: Vec<DocTarget>,
 
     pub products: Vec<DocProduct>,
+
+    #[serde(default)]
+    pub roles: Vec<DocRole>,
+
+    #[serde(default)]
+    pub attributes: Vec<DocAttribute>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DocRole {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DocAttribute {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DocCSettings {
     #[serde(rename = "decayArrays", default)]
     pub decay_arrays: bool,
@@ -94,7 +123,7 @@ impl Default for DocCSettings {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(tag = "language")]
 pub enum DocLanguage {
     #[serde(rename = "c")]
@@ -135,7 +164,15 @@ pub enum DocDialect {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+impl Into<ir::Dialect> for DocDialect {
+    fn into(self) -> ir::Dialect {
+        match self {
+            Self::Doxygen { .. } => ir::Dialect::Doxygen
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DocTarget {
     pub name: Option<String>,
 
@@ -151,7 +188,15 @@ pub struct DocTarget {
     pub dialect: DocDialect,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+impl Into<ir::Language> for DocLanguage {
+    fn into(self) -> ir::Language {
+        match self {
+            Self::C { .. } => ir::Language::C,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DocProduct {
     pub name: String,
 
@@ -309,7 +354,7 @@ impl DocProduct {
 
 impl DocManifest {
     pub fn proofread(&self, diags: &impl DiagnosticReporter) -> bool {
-        let mut valid = false;
+        let mut valid = true;
         for (ix, target) in self.targets.iter().enumerate() {
             valid &= target.proofread(ix, diags);
             if self.targets.len() > 1 {
@@ -346,6 +391,20 @@ impl DocManifest {
         }
 
         valid
+    }
+}
+
+impl DocManifest {
+    pub fn targets(&self) -> impl Iterator<Item = driver::Target> {
+        self.targets
+            .iter()
+            .enumerate()
+            .map(|(ix, t)| driver::Target {
+                name: t.name.clone().unwrap_or_else(|| ix.to_string()),
+                files: t.files.clone(),
+                dialect: t.dialect.clone().into(),
+                language: t.language.clone().map(|l| l.into())
+            })
     }
 }
 

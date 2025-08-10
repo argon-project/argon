@@ -149,6 +149,7 @@ pub trait DiagnosticReporter {
     fn diagnose<D: Diagnostic<L>, L: EditorLocation>(&self, diagnostic: D);
 }
 
+#[derive(Clone)]
 pub struct ConsoleDiagnostics;
 
 impl DiagnosticReporter for ConsoleDiagnostics {

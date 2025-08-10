@@ -9,16 +9,22 @@ use simple_logger::SimpleLogger;
 use std::{
     borrow::Cow, fs, io::{self, IsTerminal, Read}, path::{
         Path, PathBuf
-    }, process::ExitCode, str::FromStr, vec
+    }, process::ExitCode, str::FromStr, sync::{Arc, Mutex}, vec
 };
 use json5;
 use encoding::{self, Encoding};
-use argon::compiler::{
+use tokio::task::JoinSet;
+use argon::{
+    compiler::{
         diagnostics::{
             self, DiagnosticReporter, FileAttachableDiagnostic, FileDiagnosticsExtension
         },
         strings
-    };
+    },
+    driver,
+    ir,
+    frontend::c
+};
 
 #[derive(Debug, thiserror::Error)]
 enum CLIError {
@@ -69,7 +75,7 @@ fn try_well_known_config_paths() -> Option<PathBuf> {
         "doc.json", 
         "doc/doc.json", 
         "docs/doc.json", 
-        "Documentation/doc.json"
+        "Documentation/doc.json",
     ].map(|p| Path::new(p));
 
     paths.iter()
@@ -77,14 +83,21 @@ fn try_well_known_config_paths() -> Option<PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
-fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> {
+fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf, bool), CLIError> {
     let mut stdin = io::stdin();
-    if (file.is_none() && !stdin.is_terminal()) || file.as_ref().map(|f| f.as_os_str() == "<stdin>") == Some(true) {
+    let is_forced_stdin = file.as_ref().map(|f| f.as_os_str() == "<stdin>") == Some(true);
+    if is_forced_stdin {
         let mut buffer: Vec<u8> = vec![];
-        if stdin.read_to_end(&mut buffer).is_ok() {
+        stdin.read_to_end(&mut buffer)
+            .map_err(|e| CLIError::UnreadableManifest(PathBuf::from_str("<stdin>").unwrap(), e))?;
+        return Ok((buffer, PathBuf::from_str("<stdin>").unwrap(), true))
+    }
+    else if file.is_none() && !stdin.is_terminal() {
+        let mut buffer: Vec<u8> = vec![];
+        if stdin.read_to_end(&mut buffer).is_ok()  {
             if !buffer.is_empty() {
                 debug!("Using stdin as config file");
-                return Ok((buffer, PathBuf::from_str("<stdin>").unwrap()))
+                return Ok((buffer, PathBuf::from_str("<stdin>").unwrap(), true))
             }
         }
     }
@@ -97,7 +110,7 @@ fn read_manifest(file: Option<PathBuf>) -> Result<(Vec<u8>, PathBuf), CLIError> 
 
     fs::read(config_file.as_path())
         .map_err(|e| CLIError::UnreadableManifest(config_file.clone(), e))
-        .map(|data| (data, config_file))
+        .map(|data| (data, config_file, false))
 }
 
 fn parse_manifest(data: &[u8], args: &Arguments) -> Result<argon::driver::manifest::v1::DocManifest, CLIError> {
@@ -139,7 +152,7 @@ async fn main() -> ExitCode {
 
     let diags = diagnostics::ConsoleDiagnostics;
 
-    let (manifest, manifest_path) = match read_manifest(args.manifest.clone()) {
+    let (manifest, manifest_path, from_stdin) = match read_manifest(args.manifest.clone()) {
         Ok(x) => x,
         Err(e) => {
             diags.diagnose(e);
@@ -155,11 +168,55 @@ async fn main() -> ExitCode {
             },
         };
 
-    if !manifest.proofread(&diags.inside(manifest_path)) {
+    if !manifest.proofread(&diags.clone().inside(manifest_path.clone())) {
+        debug!("Manifest is invalid");
         return ExitCode::FAILURE;
     }
 
-    println!("{:?}", manifest);
+    debug!("{:?}", manifest);
+
+    let graph = Arc::new(Mutex::new(ir::EntryGraph::new()));
+
+    let cwd = std::env::current_dir().ok();
+
+    if cwd.is_none() {
+        debug!("could not retrieve current working dir");
+    }
+
+    let base_path = if from_stdin {
+        cwd.unwrap_or(PathBuf::new())
+    } else {
+        manifest_path.parent().map_or(PathBuf::new(), |p| p.to_path_buf())
+    };
+
+    let config = Arc::new(driver::Config {
+        base_path,
+        roles: manifest.roles
+            .iter()
+            .map(|r| (r.id.clone(), driver::Role { label: r.label.clone() }))
+            .collect(),
+        attributes: manifest.attributes
+            .iter()
+            .map(|a| (a.id.clone(), driver::Attribute { label: a.label.clone() }))
+            .collect(),
+        
+        doxygen: driver::DoxygenSettings { 
+            commands: vec![] 
+        },
+        c: driver::CLanguageSettings { 
+            sema_gen: c::sema_gen::Config::default()
+        }
+    });
+    
+    match driver::compile(manifest.targets(), graph, config, &diags).await {
+        Ok(()) => {
+            debug!("Sucessfully compiled targets")
+        },
+        Err(e) => {
+            diags.diagnose(e);
+            return ExitCode::FAILURE;
+        }
+    }
 
     ExitCode::SUCCESS
 }

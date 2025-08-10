@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex
 };
-use tokio::task::JoinSet;
+use tokio::task::{
+    JoinError,
+    JoinSet,
+};
 use glob::{
     glob, GlobError, PatternError
 };
@@ -26,23 +29,23 @@ use crate::compiler::{
 pub mod manifest;
 
 pub struct Target {
-    name: String,
-    files: Vec<String>,
-    language: Option<ir::Language>,
-    dialect: ir::Dialect,
+    pub name: String,
+    pub files: Vec<String>,
+    pub language: Option<ir::Language>,
+    pub dialect: ir::Dialect,
 }
 
 pub struct Product {
-    format: String,
-    targets: Option<Vec<String>>,
+    pub format: String,
+    pub targets: Option<Vec<String>>,
 }
 
 pub struct Role {
-    label: String
+    pub label: String
 }
 
-pub struct Property {
-    label: String
+pub struct Attribute {
+    pub label: String
 }
 
 pub struct CLanguageSettings {
@@ -54,9 +57,9 @@ pub struct DoxygenSettings {
 }
 
 pub struct DoxygenCommand {
-    name: String,
-    parameters: Vec<String>,
-    actions: HashMap<String, DoxygenAction>,
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub actions: HashMap<String, DoxygenAction>,
 }
 
 pub struct DoxygenAction {
@@ -64,14 +67,12 @@ pub struct DoxygenAction {
 }
 
 pub struct Config {
-    pub config_path: PathBuf,
     pub base_path: PathBuf,
-
     pub doxygen: DoxygenSettings,
     pub c: CLanguageSettings,
 
     pub roles: HashMap<String, Role>,
-    pub properties: HashMap<String, Property>,
+    pub attributes: HashMap<String, Attribute>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,11 +86,17 @@ pub enum TargetError {
     #[error("The {0} dialect specified in target {1} is not supported")]
     UnsupportedDialect(ir::Dialect, String),
 
+    #[error("The target '{0}' is misconfigured")]
+    InvalidTargetConfiguration(String),
+
     #[error(transparent)]
     CAST(#[from] c::ast::ASTError),
 
     #[error(transparent)]
-    CSema(#[from] c::sema_gen::SemaGenError<&'static dyn error::Error>),
+    CSema(#[from] c::sema_gen::SemaGenError<PatternError>),
+
+    #[error("Failed to wait for task, {0}")]
+    Concurrency(#[from] JoinError),
 }
 
 impl diagnostics::Diagnostic for TargetError {
@@ -103,27 +110,35 @@ impl diagnostics::Diagnostic for TargetError {
 }
 
 impl Target {
-    async fn compile(
+    pub async fn compile(
         &self, 
-        tasks: &mut JoinSet<Result<(), ()>>, 
+        tasks: &mut JoinSet<Result<(), TargetError>>, 
         graph: Arc<Mutex<ir::EntryGraph>>,
         config: Arc<Config>,
         diags: &impl DiagnosticReporter
     ) -> Result<usize, TargetError> {
         
-
         let base = config.base_path
             .to_str()
             .map_or(String::new(), |s| 
                 s.to_string());
 
-        let pattern_results = self.files.iter().enumerate()
+        let mut is_misconfigured = false;
+
+        let pattern_results: Vec<(usize, glob::Paths)> = self.files.iter().enumerate()
             .filter_map(|(i, f)| glob((base.clone() + f).as_str())
-                .map_err(|e| diags.diagnose(TargetError::InvalidGlobPattern(
-                        self.name.clone(), f.clone(), e)))
+                .map_err(|e| { 
+                    is_misconfigured = true;
+                    diags.diagnose(TargetError::InvalidGlobPattern(
+                        self.name.clone(), f.clone(), e));
+                    })
                 .ok()
                 .map(|paths| (i, paths))
-            );
+            ).collect();
+
+        if is_misconfigured {
+            return Err(TargetError::InvalidTargetConfiguration(self.name.clone()));
+        }
 
         let mut count = 0;
 
@@ -169,4 +184,26 @@ impl Target {
 
         Ok(0)
     }
+}
+
+pub async fn compile(
+    targets: impl Iterator<Item = Target>,
+    graph: Arc<Mutex<ir::EntryGraph>>,
+    config: Arc<Config>,
+    diags: &impl DiagnosticReporter
+) -> Result<(), TargetError> {
+    let mut tasks = JoinSet::<Result<(), TargetError>>::new();
+
+    for target in targets {
+        target.compile(&mut tasks, graph.clone(), config.clone(), diags).await?;
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(result) => result?,
+            Err(join_error) => return Err(TargetError::Concurrency(join_error))
+        };
+    }
+
+    Ok(())
 }
