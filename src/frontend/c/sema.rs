@@ -6,6 +6,8 @@ use std::fmt;
 
 use strum_macros::EnumString;
 
+use crate::ir::SymbolLikeness;
+
 #[derive(Clone)]
 pub enum Symbol {
     function(Function),
@@ -15,8 +17,38 @@ pub enum Symbol {
     union(Union),
     enumeration(Enum),
     macroDefintion(MacroDefinition),
-    header(TranslationUnit),
-    source(TranslationUnit),
+    // header(TranslationUnit),
+    // source(TranslationUnit),
+}
+
+impl Symbol {
+    pub fn likeness(&self) -> SymbolLikeness {
+        match self {
+            Self::function(_) => SymbolLikeness::Function,
+            Self::variable(_) => SymbolLikeness::Variable,
+            Self::typeDefinition(definition) => definition.originalType.decl.likeness(),
+            Self::structure(_) | Self::union(_) => SymbolLikeness::Structure,
+            Self::enumeration(_) => SymbolLikeness::Enumeration,
+            Self::macroDefintion(definition) => if definition.parameters.is_empty() {
+                SymbolLikeness::Constant
+            } else {
+                SymbolLikeness::Function
+            },
+            // Self::header(_) | Self::source(_) => SymbolLikeness::File,
+        }
+    }
+}
+
+impl TypeDecl {
+    pub fn likeness(&self) -> SymbolLikeness {
+        match self {
+            Self::function(_) => SymbolLikeness::Function,
+            Self::enumeration(_) => SymbolLikeness::Enumeration,
+            Self::structure(_) | Self::union(_) => SymbolLikeness::Structure,
+            Self::pointer(pointer) => pointer.pointeeType.decl.likeness(),
+            _ => SymbolLikeness::Statement,
+        }
+    }
 }
 
 // TODO: include graph? -> would require us to include paths
@@ -548,8 +580,8 @@ impl fmt::Display for Symbol {
             Self::union(x) => write!(f, "union {x}"),
             Self::enumeration(x) => write!(f, "{x}"),
             Self::macroDefintion(x) => write!(f, "{x}"),
-            Self::header(x) => write!(f, "{x}"),
-            Self::source(x) => write!(f, "{x}"),
+            // Self::header(x) => write!(f, "{x}"),
+            // Self::source(x) => write!(f, "{x}"),
         }
     }
 }

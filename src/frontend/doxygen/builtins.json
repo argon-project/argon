@@ -1,0 +1,288 @@
+{
+    "defgroup": {
+        arguments: ["id", "title.."],
+        actions: [
+            {
+                action: "CreateEntry",
+                id: "$id",
+                title: "$title",
+                allowMemberScope: true
+            }
+        ]
+    },
+    "addtogroup": {
+        arguments: ["id", "title..?"],
+        actions: [
+            {
+                action: "MoveToEntry",
+                id: "$id"
+            },
+            {
+                action: "EmitDiagnostic",
+                level: "warning",
+                message: {
+                    "title": "Title passed to the addtogroup command is ignored"
+                }
+            }
+        ]
+    },
+    "ingroup": {
+        // TODO: Support infinite white-space separated arguments in pulldown-cmark
+        arguments: ["id+"],
+        actions: [
+            {
+                action: "ForEach",
+                iterable: "id",
+            },
+            {
+                action: "AddMembership",
+                id: "$id"
+            }
+        ]
+    },
+    "memberof": {
+        arguments: ["id"],
+        actions: [
+            {
+                action: "AddMembership",
+                id: "$id"
+            }
+        ]
+    },
+    "name": {
+        arguments: ["title.."],
+        actions: [
+            {
+                action: "CreateMemberSection",
+                title: "$title"
+            }
+        ]
+    },
+    "param": {
+        arguments: ["[in]", "[out]", "[inout]", "'-'?", "name", "description...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "parameter",
+                title: "$name",
+                description: "$description",
+                modifiers: {
+                    "$[in]": "ptrIn",
+                    "$[out]": "ptrOut",
+                    "$[inout]": ["ptrIn", "ptrOut"],
+                }
+            }
+        ]
+    },
+    "returns": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "returns",
+                description: "$paragraph",
+            }
+        ]
+    },
+    "return": "returns",
+    "retval": {
+        arguments: ["title", "description....?"],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "returns",
+                title: "$title",
+                description: "$description",
+            }
+        ]
+    },
+    "throws": {
+        arguments: ["error", "description....?"],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "throws",
+                title: "$error",
+                description: "$description",
+            }
+        ]
+    },
+    "throw": "todo",
+    "throws": {
+        arguments: ["description...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "todo",
+                description: "$description",
+            }
+        ]
+    },
+    "note": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "TemplateRichText",
+                template: "> [!NOTE]\n> $paragraph"
+            }
+        ]
+    },
+    "warning": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "TemplateRichText",
+                template: "> [!WARNING]\n> $paragraph"
+            }
+        ]
+    },
+    "attention": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "TemplateRichText",
+                template: "> [!CAUTION]\n> $text"
+            }
+        ]
+    },
+    "important": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "TemplateRichText",
+                template: "> [!IMPORTANT]\n> $text"
+            }
+        ]
+    },
+    "remark": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "TemplateRichText",
+                template: "> [!TIP]\n> $text"
+            }
+        ]
+    },
+    "remarks": "remark",
+    "author": {
+        arguments: ["author.."],
+        actions: [
+            {
+                action: "AddAttribute",
+                id: "author",
+                value: "$author"
+            }
+        ]
+    },
+    "authors": "author",
+
+    "brief": {
+        arguments: ["abstract...."],
+        actions: [
+            {
+                action: "SetAbstract",
+                content: "$abstract",
+            }
+        ]
+    },
+    "short": "brief",
+    "details": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "PassThrough",
+                content: "$paragraph",
+            }
+        ]
+    },
+    "bug": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "issue",
+                description: "$paragraph"
+            }
+        ]
+    },
+    "invariant": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "invariant",
+                description: "$paragraph"
+            }
+        ]
+    },
+    "pre": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "cond.pre",
+                description: "$paragraph"
+            }
+        ]
+    },
+    "post": {
+        arguments: ["paragraph...."],
+        actions: [
+            {
+                action: "AddSectionItem",
+                kind: "cond.post",
+                description: "$paragraph"
+            }
+        ]
+    },
+    "qualifier": {
+        arguments: ["id"],
+        actions: [
+            {
+                action: "AddModifier",
+                modifier: "$id"
+            }
+        ]
+    },
+    "file": {
+        arguments: ["name?"],
+        actions: [
+            {
+                action: "CreateEntry",
+                id: "$id",
+                title: "$name ?? $FileName"
+            },
+            {
+                action: "InferFileRole",
+                filename: "$name ?? $FileName",
+                variable: "role"
+            },
+            {
+                action: "SetRole",
+                role: "$role"
+            }
+        ]
+    },
+    "lineinfo": {
+        actions: [
+            {
+                action: "TemplateText",
+                template: "$LineNumber",
+            }
+        ]
+    },
+    "fileinfo": {
+        arguments: ["{name}", "{extension}", "{filename}", "{directory}", "{full}"],
+        actions: [
+            {
+                action: "TemplateText",
+                template: {
+                    "${name}": "$FileName",
+                    "${extension}": "$FileExtension",
+                    "${directory}": "$ParentDirectory",
+                    "${full}": "$FilePath",
+                }
+            }
+        ]
+    },
+}

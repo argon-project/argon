@@ -58,17 +58,13 @@ pub mod v1 {
         Serialize
     };
     use crate::{
-        driver,
-        ir,
-        backend,
-        
-        compiler::{
+        backend, compiler::{
             diagnostics::{
                 self, 
                 DiagnosticReporter
             }, 
             strings
-        }, 
+        }, driver, ir::{self, RichText} 
     };
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -82,6 +78,9 @@ pub struct DocManifest {
 
     #[serde(default)]
     pub attributes: Vec<DocAttribute>,
+
+    #[serde(default)]
+    pub modifiers: Vec<DocModifier>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -91,7 +90,70 @@ pub struct DocRole {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum DocValueType {
+    #[serde(rename = "string")]
+    String,
+    
+    #[serde(rename = "int")]
+    Integer,
+    
+    #[serde(rename = "uint")]
+    UnsignedInteger,
+
+    /// Label + URI
+    #[serde(rename = "link")]
+    Link,
+
+    /// Attribute Present or not
+    #[serde(rename = "boolean")]
+    Boolean,
+}
+
+impl Default for DocValueType {
+    fn default() -> Self {
+        Self::String
+    }
+}
+
+impl Into<ir::ValueType> for DocValueType {
+    fn into(self) -> ir::ValueType {
+        match self {
+            Self::String => ir::ValueType::String,
+            Self::Integer => ir::ValueType::SignedInteger,
+            Self::UnsignedInteger => ir::ValueType::UnsignedInteger,
+            Self::Link => ir::ValueType::Link,
+            Self::Boolean => ir::ValueType::Void,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DocAttribute {
+    pub id: String,
+    pub label: String,
+
+    #[serde(rename = "type", default)]
+    pub value_type: DocValueType,
+    
+    #[serde(default)]
+    pub repeatable: bool,
+
+    pub description: Option<String>,
+}
+
+impl Into<ir::Attribute> for DocAttribute {
+    fn into(self) -> ir::Attribute {
+        ir::Attribute {
+            label: self.label.clone(),
+            value_type: self.value_type.into(),
+            repeatable: self.repeatable,
+            description: self.description.map(|d| RichText::common_mark_text(&d))
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DocModifier {
     pub id: String,
     pub label: String,
     pub description: String,
@@ -403,7 +465,8 @@ impl DocManifest {
                 name: t.name.clone().unwrap_or_else(|| ix.to_string()),
                 files: t.files.clone(),
                 dialect: t.dialect.clone().into(),
-                language: t.language.clone().map(|l| l.into())
+                language: t.language.clone().map(|l| l.into()),
+                encoding: t.encoding
             })
     }
 }

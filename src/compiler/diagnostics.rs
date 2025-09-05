@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::{error, path::PathBuf};
-use std::ops::Range;
+use std::ops::{Add, Range};
 use colored::{control::SHOULD_COLORIZE, Color, Colorize};
 pub use super::strings::{
     Location,
@@ -9,11 +9,105 @@ pub use super::strings::{
     Source
 };
 
+/// A tool that resolved byte ranges to points (lines, columns)
+pub struct LineResolver {
+    line_starts: Vec<(usize, usize)>
+}
+
+impl LineResolver {
+    pub fn new(text: &str) -> Self {
+        Self {
+            line_starts: text.match_indices('\n').map(|(a, b)| a).enumerate().collect()
+        }
+    }
+
+    pub fn resolve(&self, range: Range<usize>) -> Location {
+        let start_row = self.line_starts.iter()
+            .find(|i| i.1 < range.start).map(|(row_ix, char_ix)| (row_ix + 1, *char_ix)).unwrap_or((0, 0));
+
+        let end_row = self.line_starts.iter()
+            .find(|i| i.1 < range.end).map(|(row_ix, char_ix)| (row_ix + 1, *char_ix)).unwrap_or((0, 0));
+
+        Location {
+            start_byte: range.start,
+            end_byte: range.end,
+            start_point: Point {
+                row: start_row.0,
+                column: range.start - start_row.1
+            },
+            end_point: Point {
+                row: end_row.0,
+                column: range.end - end_row.1
+            },
+        }
+    }
+}
+
 pub trait EditorLocation {
     fn start_point(&self) -> Point; // row, column
     fn start_offset(&self) -> Option<usize> { None }
     fn end_offset(&self) -> Option<usize> { None }
     fn end_point(&self) -> Option<Point> { None }
+
+    fn relative_to(&self, other: &impl EditorLocation) -> MinimalLocation {
+        MinimalLocation {
+            start_point: Point { 
+                row: self.start_point().row + other.start_point().row, 
+                column: self.start_point().column
+            },
+            end_point: self.end_point().map(|p|
+                Point { 
+                    row: p.row + other.start_point().row,
+                    column: p.column 
+                }    
+            ),
+            start_offset: self.start_offset(),
+            end_offset: self.end_offset()
+        }
+    }
+
+    fn within_offset_range(&self, range: Range<usize>) -> MinimalLocation {
+        MinimalLocation {
+            start_point: Point { 
+                row: self.start_point().row, 
+                column: self.start_point().column + range.start
+            },
+            end_point: self.end_point().map(|p|
+                Point { 
+                    row: p.row,
+                    column: p.column + range.end
+                }    
+            ),
+            start_offset: self.start_offset().map(|o| o + range.start),
+            end_offset: self.end_offset().map(|o| o + range.end)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MinimalLocation {
+    pub start_point: Point,
+    pub start_offset: Option<usize>,
+    pub end_offset: Option<usize>,
+    pub end_point: Option<Point>,
+}
+
+impl EditorLocation for MinimalLocation {
+    fn start_point(&self) -> Point {
+        self.start_point
+    } 
+
+    fn start_offset(&self) -> Option<usize> {
+        self.start_offset
+    }
+
+    fn end_offset(&self) -> Option<usize> {
+        self.end_offset
+    }
+
+    fn end_point(&self) -> Option<Point> {
+        self.end_point
+    }
 }
 
 pub trait Diagnostic<L: EditorLocation = Location>: error::Error {
@@ -145,7 +239,7 @@ impl Diagnostic<json5::Location> for json5::Error {
     }
 }
 
-pub trait DiagnosticReporter {
+pub trait DiagnosticReporter: Sync + Send  {
     fn diagnose<D: Diagnostic<L>, L: EditorLocation>(&self, diagnostic: D);
 }
 
@@ -307,5 +401,31 @@ impl Into<Color> for Severity {
 impl Ord for Severity {
     fn cmp(&self, other: &Severity) -> std::cmp::Ordering {
         self.level().cmp(&other.level())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionError(pub lenient_semver::parser::ErrorKind, pub String);
+
+impl std::fmt::Display for VersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            lenient_semver::parser::ErrorKind::MissingMajorNumber =>
+                write!(f, "missing major version component"),
+            lenient_semver::parser::ErrorKind::MissingMinorNumber =>
+                write!(f, "missing minor version component"),
+            lenient_semver::parser::ErrorKind::MissingPatchNumber =>
+                write!(f, "missing patch version component"),
+            lenient_semver::parser::ErrorKind::MissingPreRelease =>
+                write!(f, "missing pre-release version component"),
+            lenient_semver::parser::ErrorKind::MissingBuild =>
+                write!(f, "mising build version component"),
+            lenient_semver::parser::ErrorKind::NumberOverflow => 
+                write!(f, "value '{}' overflows when stored in 64-bit integer",
+                    self.1
+                ),
+            lenient_semver::parser::ErrorKind::UnexpectedInput => 
+                write!(f, "Unexpected token '{}'", self.1),
+        }
     }
 }

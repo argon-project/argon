@@ -7,23 +7,30 @@ use clap::{
 use thiserror;
 use simple_logger::SimpleLogger;
 use std::{
-    borrow::Cow, fs, io::{self, IsTerminal, Read}, path::{
+    borrow::Cow, 
+     fs, 
+     io::{self, IsTerminal, Read}, 
+     path::{
         Path, PathBuf
-    }, process::ExitCode, str::FromStr, sync::{Arc, Mutex}, vec
+    }, 
+    process::ExitCode, 
+    str::FromStr, 
+    sync::{Arc, Mutex}, 
+    vec,
 };
 use json5;
 use encoding::{self, Encoding};
-use tokio::task::JoinSet;
 use argon::{
     compiler::{
         diagnostics::{
             self, DiagnosticReporter, FileAttachableDiagnostic, FileDiagnosticsExtension
         },
         strings
-    },
-    driver,
+    }, 
+    driver, 
     ir,
-    frontend::c
+    frontend,
+    backend,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -191,24 +198,22 @@ async fn main() -> ExitCode {
 
     let config = Arc::new(driver::Config {
         base_path,
-        roles: manifest.roles
-            .iter()
-            .map(|r| (r.id.clone(), driver::Role { label: r.label.clone() }))
-            .collect(),
+        roles: manifest.roles.into(),
         attributes: manifest.attributes
             .iter()
-            .map(|a| (a.id.clone(), driver::Attribute { label: a.label.clone() }))
+            .map(|a| (a.id.clone(), a.into()))
             .collect(),
-        
         doxygen: driver::DoxygenSettings { 
-            commands: vec![] 
+            commands: frontend::doxygen::commands::builtins()
         },
         c: driver::CLanguageSettings { 
-            sema_gen: c::sema_gen::Config::default()
+            sema_gen: frontend::c::sema_gen::Config::default()
         }
     });
     
-    match driver::compile(manifest.targets(), graph, config, &diags).await {
+    let diags = Arc::new(diags);
+    
+    match driver::compile(manifest.targets(), graph, config, diags.clone()).await {
         Ok(()) => {
             debug!("Sucessfully compiled targets")
         },

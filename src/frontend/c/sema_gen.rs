@@ -1,12 +1,16 @@
-use super::sema::{
-    Array, ArrayQualifier, AttachedExpression, Attribute, CType, Container,
-    DeclarationQualifier, Enum, EnumCase, Expression, Function, FunctionQualifier, Identifier,
-    IncludedHeader, MSCallModifier, MSDeclModifier, MSPointerModifier, MacroDefinition,
-    Modifier, NamedType, Parameter, Pointer, PointerQualifier, PrimitiveType, RawSpelling,
-    SizeModifier, StandardAttribute, Storage, Symbol, TypeDecl, TypeDefinition,
-    TypeQualifier, Variable,
+use super::{
+    sema::{
+        Array, ArrayQualifier, AttachedExpression, Attribute, CType, Container,
+        DeclarationQualifier, Enum, EnumCase, Expression, Function, FunctionQualifier, Identifier,
+        IncludedHeader, MSCallModifier, MSDeclModifier, MSPointerModifier, MacroDefinition,
+        Modifier, NamedType, Parameter, Pointer, PointerQualifier, PrimitiveType, RawSpelling,
+        SizeModifier, StandardAttribute, Storage, Symbol, TypeDecl, TypeDefinition,
+        TypeQualifier, Variable,
+    },
 };
-
+pub use super::recorder::{
+    Recorder, CRecorder,
+};
 use crate::{
     compiler::{
         diagnostics::{
@@ -18,7 +22,6 @@ use crate::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::{error, fmt};
-use strum_macros::Display;
 use log::{
     debug, 
     // error,
@@ -27,6 +30,7 @@ use log::{
 use tree_sitter::{
     Node,
 };
+
 
 // Tree-sitter node names originate from static C strings in generated parser,
 // hence, when emitting diagnostics containing their names, we can use a &'static str.
@@ -263,51 +267,6 @@ impl Config {
             ingore_header_guard_defines: true,
             preprocessor_defines: HashMap::<String, isize>::from([("DOXYGEN".into(), 1 as isize)]),
         }
-    }
-}
-
-pub trait Recorder<E> {
-    fn record_include(&mut self, header: IncludedHeader) -> Result<bool, E>;
-    fn record_symbol(&mut self, symbol: Symbol) -> Result<bool, E>;
-    fn record_comment(&mut self, comment: &str) -> Result<bool, E>;
-    fn finish(&mut self) -> Result<(), E>;
-}
-
-impl Recorder<()> for Vec<Symbol> {
-    fn record_include(self: &mut Self, _header: IncludedHeader) -> Result<bool, ()> {
-        Ok(false)
-    }
-
-    fn record_symbol(self: &mut Self, symbol: Symbol) -> Result<bool, ()> {
-        self.push(symbol);
-        Ok(true)
-    }
-
-    fn record_comment(self: &mut Self, _comment: &str) -> Result<bool, ()> {
-        Ok(false)
-    }
-
-    fn finish(self: &mut Self) -> Result<(), ()> {
-        Ok(())
-    }
-}
-
-impl Recorder<()> for Vec<IncludedHeader> {
-    fn record_include(self: &mut Self, header: IncludedHeader) -> Result<bool, ()> {
-        self.push(header);
-        Ok(true)
-    }
-
-    fn record_symbol(self: &mut Self, _symbol: Symbol) -> Result<bool, ()> {
-        Ok(false)
-    }
-
-    fn record_comment(self: &mut Self, _comment: &str) -> Result<bool, ()> {
-        Ok(false)
-    }
-
-    fn finish(self: &mut Self) -> Result<(), ()> {
-        Ok(())
     }
 }
 
@@ -749,7 +708,7 @@ pub fn gen_sema<S: Source, R: Recorder<E>, E>(
                 match containerFromAST(child, source, config, recorder, diags) {
                     Ok(_struct) => {
                         // If this fails, we cannot do anything..
-                        _ = recorder.record_symbol(Symbol::structure(_struct));
+                        _ = recorder.record_symbol(Symbol::structure(_struct), child.range());
                     }
                     Err(e) => {
                         diags.diagnose(ReportMessage::SemGenFailed(child.kind(), Box::new(e)));
@@ -760,7 +719,7 @@ pub fn gen_sema<S: Source, R: Recorder<E>, E>(
                 match containerFromAST(child, source, config, recorder, diags) {
                     Ok(_union) => {
                         // If this fails, we cannot do anything..
-                        _ = recorder.record_symbol(Symbol::union(_union));
+                        _ = recorder.record_symbol(Symbol::union(_union), child.range());
                     }
                     Err(e) =>  {
                         diags.diagnose(ReportMessage::SemGenFailed(child.kind(), Box::new(e)));
@@ -771,7 +730,7 @@ pub fn gen_sema<S: Source, R: Recorder<E>, E>(
                 match enumerationFromAST(child, source, config, recorder, diags) {
                     Ok(_enum) => {
                         // If this fails, we cannot do anything..
-                        _ = recorder.record_symbol(Symbol::enumeration(_enum));
+                        _ = recorder.record_symbol(Symbol::enumeration(_enum), child.range());
                     }
                     Err(e) =>  {
                         diags.diagnose(ReportMessage::SemGenFailed(child.kind(), Box::new(e)));
@@ -867,7 +826,7 @@ pub fn symbolizeMacroDefintion<S: Source, R: Recorder<E>, E>(
             .child_by_field_name("value")
             .map(|v| v.string(source))
             .transpose()?,
-    }));
+    }), ast.range());
 
     Ok(())
 }
@@ -1064,7 +1023,7 @@ pub fn symbolsInDecl<S: Source, R: Recorder<E>, E>(
             cType: _type,
             identifier: None,
             attachedExpression: None,
-        }));
+        }), ast.range());
 
         return Ok(());
     }
@@ -1110,7 +1069,7 @@ pub fn symbolsInDecl<S: Source, R: Recorder<E>, E>(
         match symbol {
             Ok(symbol) => {
                 debug!("symbol is: {symbol}");
-                _ = recorder.record_symbol(symbol);
+                _ = recorder.record_symbol(symbol, ast.range());
             }
             Err(e) => {
                 // error!(

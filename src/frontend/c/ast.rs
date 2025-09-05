@@ -10,10 +10,10 @@ use crate::compiler::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum ASTError {
-    #[error("Error with C parser")]
+    #[error("Error loading language grammar: {0}")]
     LanguageFailure(#[from] #[source] LanguageError),
 
-    #[error("C source code is not parsable")]
+    #[error("C source code is not parsable with built-in grammar")]
     UnparsableSource, 
 }
 

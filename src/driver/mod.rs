@@ -3,8 +3,10 @@
 //! Use the command-line interface instead.
 
 use std::collections::HashMap;
-use std::error;
-use std::path::PathBuf;
+use std::string::FromUtf16Error;
+use std::{error, fs, str};
+use std::path::{Path, PathBuf};
+use std::str::{FromStr, Utf8Error};
 use std::sync::{
     Arc, Mutex
 };
@@ -18,21 +20,31 @@ use glob::{
 use log::{
     debug
 };
+use crate::ir::entry_graph::{Attribute, Role};
+use crate::{
+    frontend,
+    compiler::{
+        strings,
+        diagnostics::{
+            self,
+            DiagnosticReporter
+        }
+    }
+};
 use thiserror;
 
-use crate::frontend::c;
+use crate::frontend::{c, DocumentationCommentRecorder};
 use crate::ir;
-use crate::compiler::{
-    diagnostics::{self, DiagnosticReporter},
-};
 
 pub mod manifest;
 
+#[derive(Debug, Clone)]
 pub struct Target {
     pub name: String,
     pub files: Vec<String>,
     pub language: Option<ir::Language>,
     pub dialect: ir::Dialect,
+    pub encoding: strings::Encoding
 }
 
 pub struct Product {
@@ -40,30 +52,12 @@ pub struct Product {
     pub targets: Option<Vec<String>>,
 }
 
-pub struct Role {
-    pub label: String
-}
-
-pub struct Attribute {
-    pub label: String
-}
-
 pub struct CLanguageSettings {
     pub sema_gen: c::sema_gen::Config,
 }
 
 pub struct DoxygenSettings {
-    pub commands: Vec<DoxygenCommand>,
-}
-
-pub struct DoxygenCommand {
-    pub name: String,
-    pub parameters: Vec<String>,
-    pub actions: HashMap<String, DoxygenAction>,
-}
-
-pub struct DoxygenAction {
-
+    pub commands: HashMap<String, frontend::doxygen::DoxygenCommand<'static>>,
 }
 
 pub struct Config {
@@ -71,7 +65,7 @@ pub struct Config {
     pub doxygen: DoxygenSettings,
     pub c: CLanguageSettings,
 
-    pub roles: HashMap<String, Role>,
+    pub roles: Role,
     pub attributes: HashMap<String, Attribute>,
 }
 
@@ -83,8 +77,11 @@ pub enum TargetError {
     #[error("The pattern '{1}' in target '{0}' is not resolvable: {2}")]
     Glob(String, String, GlobError),
 
-    #[error("The {0} dialect specified in target {1} is not supported")]
+    #[error("The {0} dialect specified in target '{1}' is not supported")]
     UnsupportedDialect(ir::Dialect, String),
+
+    #[error("The {0} programming language specified in target '{1}' is not supported")]
+    UnsupportedLanguage(ir::Language, String),
 
     #[error("The target '{0}' is misconfigured")]
     InvalidTargetConfiguration(String),
@@ -93,29 +90,36 @@ pub enum TargetError {
     CAST(#[from] c::ast::ASTError),
 
     #[error(transparent)]
-    CSema(#[from] c::sema_gen::SemaGenError<PatternError>),
+    CSemaUTF8(#[from] c::sema_gen::SemaGenError<Utf8Error>),
+
+     #[error(transparent)]
+    CSemaUTF16(#[from] c::sema_gen::SemaGenError<FromUtf16Error>),
 
     #[error("Failed to wait for task, {0}")]
     Concurrency(#[from] JoinError),
+
+    #[error("The file {0} used in target '{1}' could not be read: {2}")]
+    UnreadableFile(PathBuf, String, std::io::Error),
 }
 
 impl diagnostics::Diagnostic for TargetError {
     fn severity(&self) -> diagnostics::Severity {
         match self {
             Self::CAST(e) => e.severity(),
-            Self::CSema(e) => e.severity(),
+            Self::CSemaUTF8(e) => e.severity(),
+            Self::CSemaUTF16(e) => e.severity(),
             _ => diagnostics::Severity::Error,
         }
     }
 }
 
 impl Target {
-    pub async fn compile(
+    pub async fn compile<R: DiagnosticReporter>(
         &self, 
         tasks: &mut JoinSet<Result<(), TargetError>>, 
         graph: Arc<Mutex<ir::EntryGraph>>,
         config: Arc<Config>,
-        diags: &impl DiagnosticReporter
+        diags: Arc<R>
     ) -> Result<usize, TargetError> {
         
         let base = config.base_path
@@ -125,8 +129,15 @@ impl Target {
 
         let mut is_misconfigured = false;
 
-        let pattern_results: Vec<(usize, glob::Paths)> = self.files.iter().enumerate()
-            .filter_map(|(i, f)| glob((base.clone() + f).as_str())
+        let pattern_results: Vec<(usize, glob::Paths)> = self.files.iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let path = PathBuf::from_str(f).expect("std::path returned Err, but is infallible");
+                return glob(&(if path.is_absolute() {
+                    String::new()
+                } else {
+                    base.clone()
+                } + f))
                 .map_err(|e| { 
                     is_misconfigured = true;
                     diags.diagnose(TargetError::InvalidGlobPattern(
@@ -134,7 +145,7 @@ impl Target {
                     })
                 .ok()
                 .map(|paths| (i, paths))
-            ).collect();
+            }).collect();
 
         if is_misconfigured {
             return Err(TargetError::InvalidTargetConfiguration(self.name.clone()));
@@ -153,36 +164,97 @@ impl Target {
                     continue;
                 };
 
+                debug!("Target {} has {}", self.name, path.display());
+
                 count += 1;
 
-                debug!("Target {} has {}", self.name, path.display());
+                let target = self.clone();
+
+                let graph = graph.clone();
+                let config = config.clone();
+                let diags = Arc::new(crate::compiler::diagnostics::ConsoleDiagnostics);
+
+                tasks.spawn(async move {
+                   target.compile_file(path, graph, &config, diags)
+                });
             }
-
-            count += 1;
-
-            let language = self.language.clone();
-            let dialect = self.dialect.clone();
-
-            tasks.spawn(async move {
-                match language {
-                    Some(ir::Language::C) => {
-                        debug!("found C source")
-                    },
-                    _ => {}
-                };
-
-                match dialect {
-                    ir::Dialect::Doxygen => {
-
-                    },
-                    _ => {}
-                };
-
-                Ok(())
-            });
         }
 
-        Ok(0)
+        Ok(count)
+    }
+
+    fn compile_file<R: DiagnosticReporter>(
+        &self,
+        path: PathBuf,
+        graph: Arc<Mutex<ir::EntryGraph>>,
+        config: &Config,
+        diags: Arc<R>
+    ) -> Result<(), TargetError> {
+        let data = fs::read(&path)
+            .map_err(|e| TargetError::UnreadableFile(path.clone(), self.name.clone(), e))?;
+
+        match self.dialect {
+            ir::Dialect::Doxygen => {
+                let mut recorder = frontend::doxygen::DoxygenRecorder::new(
+                    graph.clone(), 
+                    &config.doxygen
+                );
+                if self.language.is_some() {
+                    self.compile_source_code(data, graph, config, diags, &recorder)?;
+                }
+            },
+            _ => return Err(TargetError::UnsupportedDialect(self.dialect, self.name.clone()))
+        }
+
+        Ok(())
+    }
+
+    fn compile_source_code<R: DiagnosticReporter, CR: DocumentationCommentRecorder>(
+        &self,
+        data: Vec<u8>,
+        graph: Arc<Mutex<ir::EntryGraph>>,
+        config: &Config,
+        diags: Arc<R>,
+        recorder: &CR
+    ) -> Result<(), TargetError> {
+        if let Some(language) = self.language {
+            match language {
+                ir::Language::C => {
+                    let mut recorder = frontend::c::sema_gen::CRecorder::new(recorder);
+                    match self.encoding {
+                        strings::Encoding::UTF8 => {
+                        let ast = frontend::c::ast::gen_ast_utf8(data.as_slice(), None)?;
+                           frontend::c::sema_gen::gen_sema(
+                                ast.root_node(), 
+                                data.as_slice(), 
+                                &config.c.sema_gen, 
+                                &mut recorder, 
+                                diags.as_ref()
+                            )
+                            .map_err(|e| TargetError::CSemaUTF8(e))?;
+                        }
+                        strings::Encoding::UTF16(endianness) => {
+                            let (_, middle, _) = unsafe { data.align_to::<u16>() };
+                            let ast = frontend::c::ast::gen_ast_utf16(middle, None, endianness)?;
+                            frontend::c::sema_gen::gen_sema(
+                                ast.root_node(), 
+                                middle, 
+                                &config.c.sema_gen, 
+                                &mut recorder, 
+                                diags.as_ref()
+                            )
+                            .map_err(|e| TargetError::CSemaUTF16(e))?;
+                        }
+                    };
+                }
+
+                language => {
+                    return Err(TargetError::UnsupportedLanguage(language, self.name.clone()))
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -190,12 +262,14 @@ pub async fn compile(
     targets: impl Iterator<Item = Target>,
     graph: Arc<Mutex<ir::EntryGraph>>,
     config: Arc<Config>,
-    diags: &impl DiagnosticReporter
+    diags: Arc<impl DiagnosticReporter>
 ) -> Result<(), TargetError> {
     let mut tasks = JoinSet::<Result<(), TargetError>>::new();
 
     for target in targets {
-        target.compile(&mut tasks, graph.clone(), config.clone(), diags).await?;
+        // Compile target. Compilation of the targeted files will be performed in parallel
+        // using the task group from above.
+        target.compile(&mut tasks, graph.clone(), config.clone(), diags.clone()).await?;
     }
 
     while let Some(result) = tasks.join_next().await {
