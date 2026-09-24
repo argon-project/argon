@@ -10,6 +10,7 @@ use std::str::{FromStr, Utf8Error};
 use std::sync::{
     Arc, Mutex
 };
+use strict_yaml_rust::strict_yaml::Hash;
 use tokio::task::{
     JoinError,
     JoinSet,
@@ -23,6 +24,7 @@ use log::{
 use crate::ir::entry_graph::{Attribute, Role};
 use crate::{
     frontend,
+    ir,
     compiler::{
         strings,
         diagnostics::{
@@ -32,10 +34,6 @@ use crate::{
     }
 };
 use thiserror;
-
-use crate::frontend::{c, DocumentationCommentRecorder};
-use crate::ir;
-
 pub mod manifest;
 
 #[derive(Debug, Clone)]
@@ -43,7 +41,9 @@ pub struct Target {
     pub name: String,
     pub files: Vec<String>,
     pub language: Option<ir::Language>,
+    pub language_config: frontend::LanguageSettings,
     pub dialect: ir::Dialect,
+    pub dialect_config: frontend::DialectConfig,
     pub encoding: strings::Encoding
 }
 
@@ -52,21 +52,8 @@ pub struct Product {
     pub targets: Option<Vec<String>>,
 }
 
-pub struct CLanguageSettings {
-    pub sema_gen: c::sema_gen::Config,
-}
-
-pub struct DoxygenSettings {
-    pub commands: HashMap<String, frontend::doxygen::DoxygenCommand<'static>>,
-}
-
 pub struct Config {
     pub base_path: PathBuf,
-    pub doxygen: DoxygenSettings,
-    pub c: CLanguageSettings,
-
-    pub roles: Role,
-    pub attributes: HashMap<String, Attribute>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -86,28 +73,19 @@ pub enum TargetError {
     #[error("The target '{0}' is misconfigured")]
     InvalidTargetConfiguration(String),
 
-    #[error(transparent)]
-    CAST(#[from] c::ast::ASTError),
-
-    #[error(transparent)]
-    CSemaUTF8(#[from] c::sema_gen::SemaGenError<Utf8Error>),
-
-     #[error(transparent)]
-    CSemaUTF16(#[from] c::sema_gen::SemaGenError<FromUtf16Error>),
-
     #[error("Failed to wait for task, {0}")]
     Concurrency(#[from] JoinError),
 
     #[error("The file {0} used in target '{1}' could not be read: {2}")]
     UnreadableFile(PathBuf, String, std::io::Error),
+    
+    #[error(transparent)]
+    CLanguageError(#[from] frontend::c::CLanguageError),
 }
 
 impl diagnostics::Diagnostic for TargetError {
     fn severity(&self) -> diagnostics::Severity {
         match self {
-            Self::CAST(e) => e.severity(),
-            Self::CSemaUTF8(e) => e.severity(),
-            Self::CSemaUTF16(e) => e.severity(),
             _ => diagnostics::Severity::Error,
         }
     }
@@ -132,7 +110,7 @@ impl Target {
         let pattern_results: Vec<(usize, glob::Paths)> = self.files.iter()
             .enumerate()
             .filter_map(|(i, f)| {
-                let path = PathBuf::from_str(f).expect("std::path returned Err, but is infallible");
+                let path = PathBuf::from_str(f).expect("std::path returned Err, but is infallible; please file an bug report.");
                 return glob(&(if path.is_absolute() {
                     String::new()
                 } else {
@@ -183,7 +161,7 @@ impl Target {
         Ok(count)
     }
 
-    fn compile_file<R: DiagnosticReporter>(
+    pub fn compile_file<R: DiagnosticReporter>(
         &self,
         path: PathBuf,
         graph: Arc<Mutex<ir::EntryGraph>>,
@@ -193,14 +171,29 @@ impl Target {
         let data = fs::read(&path)
             .map_err(|e| TargetError::UnreadableFile(path.clone(), self.name.clone(), e))?;
 
+        self.compile_unit(&data, path, graph, config, diags)
+    }
+
+    pub fn compile_unit<R: DiagnosticReporter>(
+        &self,
+        data: &[u8],
+        path: PathBuf,
+        graph: Arc<Mutex<ir::EntryGraph>>,
+        config: &Config,
+        diags: Arc<R>
+    ) -> Result<(), TargetError> {
         match self.dialect {
             ir::Dialect::Doxygen => {
-                let mut recorder = frontend::doxygen::DoxygenRecorder::new(
+                let recorder = frontend::doxygen::DoxygenFrontend::new(
                     graph.clone(), 
-                    &config.doxygen
+                    &self.dialect_config.doxygen,
+                    path,
+                    self.language,
+                    config,
+                    diags.as_ref()
                 );
                 if self.language.is_some() {
-                    self.compile_source_code(data, graph, config, diags, &recorder)?;
+                    self.compile_code(data, graph, config, diags.clone(), recorder)?;
                 }
             },
             _ => return Err(TargetError::UnsupportedDialect(self.dialect, self.name.clone()))
@@ -209,43 +202,22 @@ impl Target {
         Ok(())
     }
 
-    fn compile_source_code<R: DiagnosticReporter, CR: DocumentationCommentRecorder>(
+    fn compile_code<R: DiagnosticReporter, CR: frontend::SymbolCommentIngestingFrontend>(
         &self,
-        data: Vec<u8>,
+        data: &[u8],
         graph: Arc<Mutex<ir::EntryGraph>>,
         config: &Config,
         diags: Arc<R>,
-        recorder: &CR
+        recorder: CR
     ) -> Result<(), TargetError> {
         if let Some(language) = self.language {
             match language {
                 ir::Language::C => {
-                    let mut recorder = frontend::c::sema_gen::CRecorder::new(recorder);
-                    match self.encoding {
-                        strings::Encoding::UTF8 => {
-                        let ast = frontend::c::ast::gen_ast_utf8(data.as_slice(), None)?;
-                           frontend::c::sema_gen::gen_sema(
-                                ast.root_node(), 
-                                data.as_slice(), 
-                                &config.c.sema_gen, 
-                                &mut recorder, 
-                                diags.as_ref()
-                            )
-                            .map_err(|e| TargetError::CSemaUTF8(e))?;
-                        }
-                        strings::Encoding::UTF16(endianness) => {
-                            let (_, middle, _) = unsafe { data.align_to::<u16>() };
-                            let ast = frontend::c::ast::gen_ast_utf16(middle, None, endianness)?;
-                            frontend::c::sema_gen::gen_sema(
-                                ast.root_node(), 
-                                middle, 
-                                &config.c.sema_gen, 
-                                &mut recorder, 
-                                diags.as_ref()
-                            )
-                            .map_err(|e| TargetError::CSemaUTF16(e))?;
-                        }
-                    };
+                    frontend::c::gen_sema(self.encoding, 
+                        data, 
+                        &self.language_config.c, 
+                        frontend::c::sema_gen::CFrontend(recorder), 
+                        diags.as_ref())?;
                 }
 
                 language => {

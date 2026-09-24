@@ -7,4 +7,19 @@ use strum_macros::Display;
 pub enum Format {
     #[serde(rename = "html")]
     MostlyStaticHTML,
+
+    #[serde(rename = "xml")]
+    DoxyXML,
+
+    #[serde(rename = "rtf")]
+    RTF,
+
+    #[serde(rename = "man")]
+    ManPages,
+
+    #[serde(rename = "latex")]
+    LaTeX,
+
+    #[serde(rename = "docbook")]
+    DocBook,
 }

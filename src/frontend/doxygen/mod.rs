@@ -1,4 +1,7 @@
-pub mod commands;
+pub mod predefined;
+pub mod directive;
+
+use directive::*;
 
 use std::{cmp::min, collections::HashMap, convert::Infallible, iter::zip, ops::Range, path::PathBuf, str::FromStr, sync::{Arc, Mutex}, vec};
 
@@ -9,27 +12,37 @@ use thiserror;
 use tree_sitter::Point;
 
 use crate::{
-    compiler::{diagnostics::{self, EditorLocation, LocatedDiagnostic, LocationAttachableDiagnostic}, strings::Location}, 
-    driver::{self, DoxygenSettings}, 
-    frontend::{
-        actions::{
+    compiler::{diagnostics::{self, DiagnosticReporter, EditorLocation, LocatedDiagnostic, LocationAttachableDiagnostic}, strings::Location}, driver, frontend::{
+        self, SymbolCommentIngestingFrontend, actions::{
             self, Action,
-        }, 
-        arguments::{
-            Parameter,
-            Arguments,
-            ArgumentValue,
-            ArgumentValueError,
-        },
-        cmark_comment::{
-            options_from_prefix, 
-            CMARK_OPTIONS
-        }, 
-        DocumentationCommentRecorder
-    }, 
-    ir::{self, entry_graph::{AttributeLookupError, RoleLookupError}, rich_text::CommonMark, RoleID},
+        }, arguments::{
+            ArgumentValue, ArgumentValueError, Arguments, Parameter
+        }, c::{self, sema_gen::CLanguageRecorder}, cmark_comment::{
+            CMARK_OPTIONS, options_from_prefix
+        }
+    }, ir::{self, RoleID, entry_graph::{AttributeLookupError, RoleLookupError}, rich_text::CommonMark},
 };
 
+const DOXYGEN_CMARK_OPTIONS: pulldown_cmark::Options = CMARK_OPTIONS
+    .union(pulldown_cmark::Options::ENABLE_AT_DOC_TAGS)
+    .union(pulldown_cmark::Options::ENABLE_BACKSLASH_DOC_TAGS);
+
+pub(crate) const DOXYGEN_ALLOWED_ENCLOSING_DELIMITERS: doc_tags::EnclosingDelimiters = 
+    doc_tags::EnclosingDelimiters::CURLY_BRACES
+    .union(doc_tags::EnclosingDelimiters::SQUARE_BRACKETS);
+
+pub(crate) static DOXYGEN_DEFAULT_SYNTAX: doc_tags::Syntax = doc_tags::Syntax {
+    allow_inline: true,
+    allow_nesting: true,
+    argument_syntax: doc_tags::ArgumentSyntax::DelimitedSuffix(DOXYGEN_ALLOWED_ENCLOSING_DELIMITERS),
+    interrupts_paragraph: false,
+    attachment_syntax: doc_tags::AttachmentSyntax::none()
+};
+
+#[derive(Debug, Clone, Default)]
+pub struct DoxygenSettings {
+    pub directives: HashMap<String, DoxygenDirective<'static>>,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DoxygenError {
@@ -74,6 +87,9 @@ pub enum DoxygenError {
 
     #[error("Doxygen frontend does not support {0} action")]
     UnsupportedAction(String),
+
+    #[error("Doxygen directive '{0}' is not implemented")]
+    UnimplementedDirective(String),
 }
 
 impl diagnostics::Diagnostic for DoxygenError {
@@ -85,89 +101,29 @@ impl diagnostics::Diagnostic for DoxygenError {
 
     fn is_internal(&self) -> bool {
         match self {
-            Self::MissingArgumentValue(_) => true,
             _ => false,
         }
     }
 }
 
-#[derive(Clone, Debug)]
-/// Comma-separated modifier arguments
-pub enum DoxygenDelimitedParameters<'a> {
-    None,
-
-    /// Predefined keywords in square brackets
-    Keywords(&'a[&'a str]),
-
-    /// Exactly the number of specified arguments in curly braces
-    Values(&'a[&'a str], usize, usize), // names, mandatory, optional
-
-    /// Keywords with optionally assigned values (bool) using sign (char)
-    Options(char, HashMap<&'a str, bool>),
-}
-
-impl<'a> DoxygenDelimitedParameters<'a> {
-    fn delimiters(&self) -> Option<(u8, u8)> {
-        match self {
-            Self::None => None,
-            Self::Keywords(_) => Some((b'[', b']')),
-            Self::Values(_,_,_) | Self::Options(_,_) => Some((b'{', b'}'))
-        }
-    }
-}
-
-pub struct DoxygenWhitespaceSeparatedParameters<'a> {
-    pub required: Vec<&'a str>,
-    pub optional: Vec<&'a str>,
-}
-
-pub struct DoxygenAttachedParameter<'a> {
-    pub name: &'a str,
-    pub required: bool,
-}
-
-pub type DoxygenArgumentValidator = fn(&[&str], &[&str]) -> Result<(), DoxygenError>;
-
-pub struct DoxygenParameters<'a> {
-    pub delimited: DoxygenDelimitedParameters<'a>,
-    pub whitespace_separated: DoxygenWhitespaceSeparatedParameters<'a>,
-    pub attached: Option<DoxygenAttachedParameter<'a>>,
-    pub validator: Option<DoxygenArgumentValidator>,
-}
-
-pub struct DoxygenCommand<'a> {
-    /// A function that validates delimited and whitespace-separated arguments
-    pub parameters: DoxygenParameters<'a>,
-    pub syntax: pulldown_cmark::doc_tags::Syntax,
-    pub actions: Vec<actions::Action<DoxygenBuiltin>>,
-}
-
-#[repr(u8)]
-pub enum DoxygenBuiltin {
-    FileInfo,
-    LineInfo,
-    File,
-}
-
-pub struct DoxygenRecorder<'a> {
+pub struct DoxygenFrontend<'a, D: DiagnosticReporter> {
     graph: Arc<Mutex<ir::EntryGraph>>,
     settings: &'a DoxygenSettings,
     path: PathBuf,
-    language: ir::Language,
+    language: Option<ir::Language>,
     config: &'a driver::Config,
-    current_entry_id: &'a str,
-    current_entry: &'a mut ir::Entry
+    current_entry: Option<(&'a str, &'a mut ir::Entry)>,
+    diags: &'a D
 }
 
-impl<'a> DoxygenRecorder<'a> {
+impl<'a, D: DiagnosticReporter> DoxygenFrontend<'a, D> {
     pub fn new(
         graph: Arc<Mutex<ir::EntryGraph>>, 
         settings: &'a DoxygenSettings, 
         path: PathBuf, 
-        language: ir::Language, 
+        language: Option<ir::Language>, 
         config: &'a driver::Config, 
-        root_id: &'a str,
-        root: &'a mut ir::Entry
+        diags: &'a D
     ) -> Self {
         Self {
             graph,
@@ -175,30 +131,18 @@ impl<'a> DoxygenRecorder<'a> {
             path,
             language,
             config,
-            current_entry: root,
-            current_entry_id: root_id,
+            current_entry: None,
+            diags
         }
-    }
-
-    pub fn record_doxygen(
-        &self,
-        text: &str,
-    ) -> Result<(), DoxygenError> {
-        Ok(())
     }
 }
 
-const DOXYGEN_CMARK_OPTIONS: pulldown_cmark::Options = CMARK_OPTIONS
-    .union(pulldown_cmark::Options::ENABLE_AT_DOC_TAGS)
-    .union(pulldown_cmark::Options::ENABLE_BACKSLASH_DOC_TAGS);
-
-impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
+impl<'a, D: DiagnosticReporter> SymbolCommentIngestingFrontend for DoxygenFrontend<'a, D> {
     fn record_comment<'input>(
         &mut self,
         text: &'input str,
         prefix: &'static str,
         comment_location: &impl diagnostics::EditorLocation,
-        diags: &impl diagnostics::DiagnosticReporter
     ) {
         // We want to emit human-readable diagnostics. For that, we need line numbers.
         // Get the indices of the first character of each line.
@@ -207,7 +151,7 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
         let options = DOXYGEN_CMARK_OPTIONS
             .union(options_from_prefix(prefix));
 
-        let commands = &self.settings.commands;
+        let commands = &self.settings.directives;
 
         let provide_doxygen_tag_syntax = |name: &str, _options: pulldown_cmark::Options| -> Option<&pulldown_cmark::doc_tags::Syntax> {
             let Some(command) = commands.get(name) else {
@@ -215,14 +159,14 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                 // Otherwise, the command will not be parsed and will not be included in the output.
                 // However, we want to warn about unknown commands.
                 // Hence, we return a default syntax here.
-                return Some(&commands::DOXYGEN_DEFAULT_SYNTAX)
+                return Some(&DOXYGEN_DEFAULT_SYNTAX)
             };
 
             Some(&command.syntax)
         };
 
         let parser = pulldown_cmark::Parser::new_with_doc_tag_syntax_provider_callback(
-            text, 
+            text,
             options, 
             provide_doxygen_tag_syntax
         );
@@ -238,10 +182,12 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                 continue
             };
 
+            let location = line_resolver.resolve(range.clone()).relative_to(comment_location);
+
             let Some(command) = commands.get(name.as_ref()) else {
-                diags.diagnose(
+                self.diags.diagnose(
                     DoxygenError::UnknownCommand(name.into_string())
-                        .at(line_resolver.resolve(range).relative_to(comment_location))
+                        .at(location.clone())
                 );
                 continue;
             };
@@ -257,18 +203,18 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                     // - @command[] --> DoxygenError::UnexpectedArgumentDelimiters
                     // - @command[a,b,c] --> DoxygenError::UnexpectedArguments
                     if delimited_arguments.is_empty() {
-                        diags.diagnose(
+                        self.diags.diagnose(
                             DoxygenError::UnexpectedArgumentDelimiters(
                                 name.into_string(), 
                                 argument_delimiters.unwrap().0 as char, 
                                 argument_delimiters.unwrap().1 as char
                             )
-                                .at(line_resolver.resolve(range).relative_to(comment_location))
+                                .at(location.clone())
                         );
                         continue;
                     }
                 } else {
-                    diags.diagnose(
+                    self.diags.diagnose(
                         DoxygenError::MismatchingArgumentDelimiters(
                             name.into_string(), 
                             expected_delimiters.unwrap().0 as char,
@@ -276,7 +222,7 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                             argument_delimiters.unwrap().0 as char, 
                             argument_delimiters.unwrap().1 as char
                         )
-                            .at(line_resolver.resolve(range).relative_to(comment_location))
+                            .at(location.clone())
                     );
                     continue;
                 }
@@ -286,26 +232,27 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
             match &command.parameters.delimited {
                 DoxygenDelimitedParameters::None => {
                     if !delimited_arguments.is_empty() {
-                        diags.diagnose(DoxygenError::UnexpectedArguments(name.clone().into_string())
-                            .at(line_resolver.resolve(range).relative_to(comment_location))
+                        self.diags.diagnose(DoxygenError::UnexpectedArguments(name.clone().into_string())
+                            .at(location.clone())
                         );
                         continue;
                     }
                 }
 
-                DoxygenDelimitedParameters::Keywords(keywords) => {
+                DoxygenDelimitedParameters::KeywordModifiers(keywords) => {
                     let mut valid = true;
 
                     for (_, value_type, value) in &delimited_arguments {
+                        
                         if !keywords.contains(&value.as_ref()) {
                             valid = false;
-                            diags.diagnose(DoxygenError::UnknownArgument(name.clone().into_string(), value.as_ref().to_string())
-                                .at(line_resolver.resolve(range.clone()).relative_to(comment_location))
+                            self.diags.diagnose(DoxygenError::UnknownArgument(name.clone().into_string(), value.as_ref().to_string())
+                                .at(location.clone())
                             );
                             continue;
                         }
 
-                        arguments.add(value.as_ref(), ArgumentValue::Void);
+                        arguments.add(value.as_ref(), ArgumentValue::Void, location.clone());
                     }
                 }
 
@@ -319,11 +266,11 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
 
                         let Some(accepts_value) = option_keys.get(&option_key) else {
                             valid = false;
-                            diags.diagnose(DoxygenError::UnknownArgument(
+                            self.diags.diagnose(DoxygenError::UnknownArgument(
                                 name.clone().into_string(), 
                                 option_key.to_string()
                             )
-                                .at(line_resolver.resolve(range.clone()).relative_to(comment_location))
+                                .at(location.clone())
                             );
                             continue;
                         };
@@ -331,24 +278,24 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                         if let Some(option_value) = option_value {
                             if !*accepts_value {
                                 valid = false;
-                                diags.diagnose(DoxygenError::UnexpectedOptionValue(
+                                self.diags.diagnose(DoxygenError::UnexpectedOptionValue(
                                     name.clone().into_string(), 
                                     value.clone().into_string(), 
                                     option_value.to_string()
                                 )
-                                    .at(line_resolver.resolve(range.clone()).relative_to(comment_location))
+                                    .at(location.clone())
                                 );
                             }
                             continue;
                         }
 
-                        arguments.add(option_key, ArgumentValue::from_opt_str(option_value));
+                        arguments.add(option_key, ArgumentValue::from_opt_str(option_value), location.clone());
                     }
                 }
 
-                DoxygenDelimitedParameters::Values(names, mandatory_count, optional_count) => {
+                DoxygenDelimitedParameters::PositionalArguments(names, mandatory_count, optional_count) => {
                     if delimited_arguments.len() < *mandatory_count {
-                        diags.diagnose(DoxygenError::MissingArguments(
+                        self.diags.diagnose(DoxygenError::MissingArguments(
                             name.clone().into_string(), 
                             *mandatory_count, 
                             delimited_arguments.len()
@@ -359,7 +306,7 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                     }
 
                     if delimited_arguments.len() > (mandatory_count + optional_count) {
-                        diags.diagnose(DoxygenError::AdditionalArguments(
+                        self.diags.diagnose(DoxygenError::AdditionalArguments(
                             name.clone().into_string(), 
                             mandatory_count + optional_count, 
                             delimited_arguments.len()
@@ -369,8 +316,8 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                         continue;
                     }
 
-                    for (name, value) in zip(*names, delimited_arguments.iter().map(|(_,_,v)| v.as_ref())) {
-                        arguments.add(name, ArgumentValue::PlainText(value));
+                    for (name, value) in zip(*names, delimited_arguments.into_iter().map(|(_,_,v)| v)) {
+                        arguments.add(name, ArgumentValue::PlainText(value.into()), location.clone());
                     }
                 }
             };
@@ -387,7 +334,7 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
             let max_whitespace_args = min_whitespace_args + command.parameters.whitespace_separated.optional.len();
 
             if whitespace_arguments.len() < min_whitespace_args {
-                diags.diagnose(DoxygenError::MissingArguments(
+                self.diags.diagnose(DoxygenError::MissingArguments(
                     name.clone().into_string(), 
                     min_whitespace_args, 
                     whitespace_arguments.len()
@@ -403,13 +350,13 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
             // I think this is dead code.
             // Perhaps we should fail spectacularly here to indicate an error in pulldown-cmark.
             if whitespace_arguments.len() > max_whitespace_args {
-                diags.diagnose(DoxygenError::AdditionalArguments(
+                self.diags.diagnose(DoxygenError::AdditionalArguments(
                     name.clone().into_string(), 
                     max_whitespace_args, 
                     whitespace_arguments.len()
                 )
                     // TODO: Use range of arguments instead, maybe provide a 'hint range' for the command
-                    .at(line_resolver.resolve(range.clone()).relative_to(comment_location))
+                    .at(location.clone())
                 );
                 continue;
             }
@@ -424,19 +371,20 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
 
             if let Some(attached_parameter) = &command.parameters.attached {
                 if attached_parameter.required && attachment.is_empty() {
-                    diags.diagnose(DoxygenError::MissingArguments2(
+                    self.diags.diagnose(DoxygenError::MissingArguments2(
                         name.clone().into_string(), 
                         vec![attached_parameter.name.to_string()]
                     )
                     // TODO: Use range of arguments instead, maybe provide a 'hint range' for the command
-                    .at(line_resolver.resolve(range.clone()).relative_to(comment_location))
+                    .at(location.clone())
                 );
 
                 arguments.add(
                     attached_parameter.name, 
                     ArgumentValue::RichText(ir::RichText::common_mark(
                         CommonMark::new(attachment)
-                    ))
+                    )),
+                    location
                 );
             }
             } else {
@@ -447,7 +395,7 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                 // I think this is dead code.
                 // Perhaps we should fail spectacularly here to indicate an error in pulldown-cmark.
                 if !attachment.is_empty() {
-                    diags.diagnose(DoxygenError::AdditionalArguments(
+                    self.diags.diagnose(DoxygenError::AdditionalArguments(
                         name.clone().into_string(), 
                         max_whitespace_args, 
                         whitespace_arguments.len() + 1
@@ -467,23 +415,31 @@ impl<'a> DocumentationCommentRecorder for DoxygenRecorder<'a> {
                 continue;
             };
 
-            self.evaluate_command(name.as_ref(), range.clone(), &line_resolver, &command, arguments);
+            self.evaluate_command(name.as_ref(), range.clone(), &line_resolver, &command, arguments, comment_location);
         }
 
 
     }
 }
 
-impl<'a> DoxygenRecorder<'a> {
+impl<'a, D: DiagnosticReporter> DoxygenFrontend<'a, D> {
     fn evaluate_command<'input>(
         &mut self, 
         name: &'input str,
         range: Range<usize>,
         line_resolver: &diagnostics::LineResolver,
-        command: &DoxygenCommand,
+        command: &DoxygenDirective,
         arguments: Arguments<'input>,
+        comment_location: &impl diagnostics::EditorLocation,
     ) -> Result<(), DoxygenError> {
-        
+        if command.script.is_empty() {
+            self.diags.diagnose(DoxygenError::UnimplementedDirective(
+                name.into()
+            )
+                // TODO: Use range of arguments instead, maybe provide a 'hint range' for the command
+                .at(line_resolver.resolve(range.clone()).relative_to(comment_location))
+            );
+        }
 
         Ok(())
     }
@@ -492,14 +448,14 @@ impl<'a> DoxygenRecorder<'a> {
         &mut self, 
         range: Range<usize>,
         line_resolver: &diagnostics::LineResolver,
-        command: &DoxygenCommand,
+        command: &DoxygenDirective,
         arguments: Arguments<'input>,
         builtin: DoxygenBuiltin
     ) -> Result<(), DoxygenError> {
         match builtin {
             DoxygenBuiltin::FileInfo => {
-                for (option, _) in arguments.iter() {
-                    match *option {
+                for arg in arguments.iter() {
+                    match arg.name {
                         "name" => {
                             let basename = self.path.file_name().and_then(|p|p.to_str());
                         }
@@ -530,8 +486,8 @@ impl<'a> DoxygenRecorder<'a> {
 
             DoxygenBuiltin::File => {
                 let path =
-                if let Ok(Some(path)) = arguments.get_plaintext("path?") {
-                    &PathBuf::from_str(path).unwrap()
+                if let Some(path) = arguments.get("path?") {
+                    &PathBuf::from_str(&path.value.str()).unwrap()
                 } else {
                     &self.path
                 };
@@ -542,6 +498,10 @@ impl<'a> DoxygenRecorder<'a> {
 
                 let role = RoleID::from_extension(extension);
             }
+
+            DoxygenBuiltin::Doxyconfig => {
+                let config_option = arguments.get("option");
+            }
         }
 
         Ok(())
@@ -551,11 +511,11 @@ impl<'a> DoxygenRecorder<'a> {
         &mut self,
         range: Range<usize>,
         line_resolver: &diagnostics::LineResolver,
-        command: &DoxygenCommand,
+        command: &DoxygenDirective,
         arguments: Arguments<'input>,
         action: Action<DoxygenBuiltin>
     ) -> Result<(), DoxygenError> {
-        
+        Ok(())
     }
 
     fn insert_text(&mut self, text: &str) {

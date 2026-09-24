@@ -239,6 +239,53 @@ impl Diagnostic<json5::Location> for json5::Error {
     }
 }
 
+pub trait EditorLocationExtension: EditorLocation {
+    fn to_minimal_location(&self) -> MinimalLocation {
+        MinimalLocation {
+            start_point: self.start_point(),
+            start_offset: self.start_offset(),
+            end_offset: self.end_offset(),
+            end_point: self.end_point()
+        }
+    }
+}
+
+impl<T: EditorLocation> EditorLocationExtension for T {}
+
+impl EditorLocation for strict_yaml_rust::scanner::Marker {
+    fn start_point(&self) -> Point {
+        Point { row: self.line(), column: self.col() }
+    }
+
+    fn start_offset(&self) -> Option<usize> {
+        Some(self.index())
+    }
+}
+
+impl Diagnostic<strict_yaml_rust::scanner::Marker> for strict_yaml_rust::ScanError {
+    fn location(&self) -> Option<strict_yaml_rust::scanner::Marker> {
+        Some(self.marker().clone())
+    }
+}
+
+impl Diagnostic<strict_yaml_rust::scanner::Marker> for strict_yaml_rust::serde::error::Error {
+    fn location(&self) -> Option<strict_yaml_rust::scanner::Marker> {
+        match self {
+            strict_yaml_rust::serde::error::Error::MarkedMessage { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedStreamStart { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedStreamEnd { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedDocumentStart { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedDocumentEnd { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedScalar { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedSequenceStart { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedSequenceEnd { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedMappingStart { mark, .. } => Some(mark.clone()),
+            strict_yaml_rust::serde::error::Error::UnexpectedMappingEnd { mark, .. } => Some(mark.clone()),
+            _ => None
+        }
+    }
+}
+
 pub trait DiagnosticReporter: Sync + Send  {
     fn diagnose<D: Diagnostic<L>, L: EditorLocation>(&self, diagnostic: D);
 }

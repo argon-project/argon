@@ -2,20 +2,27 @@
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::hash::Hash;
+use std::mem;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use bimap::BiMap;
-use petgraph::graph::DiGraph;
+use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::prelude::DiGraphMap;
+use petgraph::Direction::{Incoming, Outgoing};
 use semver::{Op, Version};
+use serde::{Deserialize, Serialize};
 use strum_macros::{
     EnumDiscriminants,
 };
 
 use crate::compiler::URL;
-use crate::driver;
+use crate::compiler::strings::CowStr;
 use crate::ir::rich_text::{ RichText };
 use crate::frontend::c;
 use crate::ir::Language;
@@ -33,11 +40,39 @@ pub enum Symbol {
     raw(SymbolKind, String)
 }
 
+#[derive(Clone, Debug)]
+pub struct ExpressionKind {
+    highlighting_language: tree_sitter::Language,
+}
+
+#[derive(Clone)]
+pub enum Expression {
+    c(c::sema::Expression),
+    raw(ExpressionKind, String)
+}
+
+pub trait Variable {
+    fn nullable(&self) -> Option<bool> { None }
+    fn optional(&self) -> bool { false }
+    fn default(&self) -> Option<Expression> { None }
+    fn variadic(&self) -> bool { false }
+    fn pointerlike(&self) -> bool { false }
+    fn identifier(&self) -> Option<&str>;
+    fn constant(&self) -> bool { false }
+}
+
 impl Symbol {
     pub fn likeness(&self) -> SymbolLikeness {
         match self {
             Self::c(symbol) => symbol.likeness(),
             Self::raw(kind, _) => kind.likeness.clone(),
+        }
+    }
+
+    pub fn parameters<'a>(&'a self) -> Box<dyn Iterator<Item = &'a impl Variable> + 'a> {
+        match self {
+            Self::c(c::sema::Symbol::function(func)) => Box::new(func.parameters.iter()),
+            _ => Box::new(std::iter::empty()),
         }
     }
 }
@@ -50,7 +85,8 @@ pub enum SymbolLikeness {
     Constant = 3,
     Structure = 4,
     Enumeration = 5,
-    Statement = 6,
+    EnumerationCase = 6,
+    Statement = 7,
 }
 
 #[repr(u8)]
@@ -127,18 +163,20 @@ pub enum EntryLookupError {
 
 #[derive(Clone, Debug, EnumDiscriminants)]
 #[strum_discriminants(name(ValueType))]
-pub enum Value {
+pub enum Value<'a> {
     /// Rich-text value
     RichText(RichText),
 
     /// String value
-    String(String),
+    String(CowStr<'a>),
 
+    Void,
+    
     /// URI, e.g. mailto link
-    Link(URL, String),
+    Link(URL, CowStr<'a>),
 
     URI(URL),
-
+    
     /// Integer value
     SignedInteger(isize),
 
@@ -150,9 +188,25 @@ pub enum Value {
     Version(Version),
 }
 
+impl<'a, T> From<T> for Value<'a> where T: Into<CowStr<'a>> {
+    fn from(value: T) -> Self {
+        Self::String(value.into())
+    }
+}
+
+impl<'a> Value<'a> {
+    pub fn into_static(self) -> Value<'static> {
+        match self {
+            Self::String(s) => Value::String(s.into_static()),
+            Self::Link(url, s) => Value::Link(url, s.into_static()),
+            a => unsafe { std::mem::transmute(a) }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MemberSection {
-    pub label: String,
+    pub title: String,
     
     pub description: Option<RichText>,
 
@@ -160,14 +214,28 @@ pub struct MemberSection {
 }
 
 #[derive(Clone, Debug)]
-pub struct CharacteristicKind(String, String);
+pub struct CharacteristicSection(Cow<'static, str>);
 
-#[derive(Clone, Debug)]
-pub enum CharacteristicSection {
-    Parameters,
-    ReturnValue,
-    ThrownError,
-    Custom(CharacteristicKind)
+
+impl CharacteristicSection {
+    pub const fn predefined(identifier: &'static str) -> Self {
+        Self(Cow::Borrowed(identifier))
+    }
+
+    pub const PARAMETERS: CharacteristicSection = CharacteristicSection::predefined("arg");
+    pub const RETURNS: CharacteristicSection = CharacteristicSection::predefined("ret");
+    pub const THROWS: CharacteristicSection = CharacteristicSection::predefined("err");
+    pub const PRECONDITION: CharacteristicSection = CharacteristicSection::predefined("c.pre");
+    pub const POSTCONDITION: CharacteristicSection = CharacteristicSection::predefined("c.post");
+    pub const ISSUES: CharacteristicSection = CharacteristicSection::predefined("issue");
+}
+
+impl FromStr for CharacteristicSection {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Cow::Owned(s.to_owned())))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +251,8 @@ pub struct CharacteristicModifier(String);
 
 #[derive(Clone)]
 pub struct Entry {
+    graph_id: Option<NodeIndex>,
+
     pub role: RoleID,
 
     pub title: String,
@@ -191,13 +261,11 @@ pub struct Entry {
 
     pub description: Option<RichText>,
 
-    pub attributes: Vec<(String, Value)>,
+    pub attributes: AttributeValues<'static>,
 
     pub symbols: Vec<Symbol>,
 
-    pub members: Vec<String>,
-
-    pub characterstic_sections: Vec<CharacteristicSection>,
+    // pub aspects: AspectItems,
 
     pub member_sections: Vec<MemberSection>,
 }
@@ -205,13 +273,14 @@ pub struct Entry {
 impl Entry {
     pub fn named(title: String) -> Self {
         Self {
+            graph_id: None,
             role: RoleID::group,
             title: title,
             abstract_: None,
             description: None,
-            attributes: vec![],
+            attributes: AttributeValues::default(),
             symbols: vec![],
-            characterstic_sections: vec![],
+            // aspects: AspectItems::default(),
             member_sections: vec![],
         }
     }
@@ -220,27 +289,21 @@ impl Entry {
         self.role = role
     }
 
-    pub fn get_attribute_mut(&mut self, key: &str) -> Option<&mut Value> {
-        self.attributes.iter_mut().find(|(a,_)| *a == key).map(|(_, v)| v)
+    pub fn can_add_member(&self, role: RoleID) -> bool {
+        self.role.is_member_allowed(role)
     }
 
-    pub fn get_attribute(&self, key: &str) -> Option<Value> {
-        self.attributes.iter().find(|(a,_)| *a == key).map(|(_, v)| v.clone())
+    pub fn add_member_section(&mut self, title: String, description: Option<RichText>) -> &mut MemberSection {
+        self.member_sections.push(MemberSection { title, description, members: vec![] });
+        self.member_sections.last_mut().unwrap()
     }
 
-    pub fn get_attributes(&self, key: &str) -> Vec<Value> {
-        self.attributes.iter().filter(|(a,_)| *a == key).map(|(_, v)| v.clone()).collect()
-    }
-
-    pub fn get_attributes_mut(&mut self, key: &str) -> Vec<&mut Value> {
-        self.attributes.iter_mut().filter(|(a,_)| *a == key).map(|(_, v)| v).collect()
-    }
-
-    pub fn set_attribute(&mut self, key: String, value: Value) {
-        if let Some(existing_value) = self.get_attribute_mut(&key) {
-            *existing_value = value;
+    pub fn add_symbols(&mut self, symbols: Vec<Symbol>) {
+        if self.symbols.is_empty() {
+            self.symbols = symbols
         } else {
-            self.attributes.push((key, value));
+            let mut symbols = symbols;
+            self.symbols.append(&mut symbols);
         }
     }
 
@@ -248,36 +311,24 @@ impl Entry {
         self.abstract_= Some(abstract_)
     }
 
-    pub fn add_attribute(&mut self, key: String, value: Value) {
-        self.attributes.push((key, value));
-    }
+}
 
-    pub fn can_add_member(&self, role: RoleID) -> bool {
-        self.role.is_member_allowed(role)
-    }
-
-    pub fn add_member(&mut self, id: String) {
-        self.members.push(id);
-    }
+#[derive(Clone, Debug)]
+pub struct InliningBehavior {
+    pub ordered: bool
 }
 
 
+#[derive(Clone, Debug)]
 pub struct Role {
     pub label: String,
-    pub id: RoleID
+    pub inlining_behavior: Option<InliningBehavior>
 }
 
 impl Role {
-    pub fn id(&self) -> RoleID {
-        self.id.clone()
+    pub fn inline(&self) -> bool {
+        self.inlining_behavior.is_some()
     }
-}
-
-pub struct Attribute {
-    pub label: String,
-    pub repeatable: bool,
-    pub value_type: ValueType,
-    pub description: Option<RichText>
 }
 
 pub struct Roles {
@@ -294,27 +345,22 @@ impl Default for Roles {
     }
 }
 
-impl From<Vec<crate::driver::manifest::v1::DocRole>> for Roles {
-    fn from(roles: Vec<crate::driver::manifest::v1::DocRole>) -> Self {
-        Self::from_manifest_v1(roles)
-    }
-}
-
-impl Roles {
-
-    pub fn from_manifest_v1(roles: Vec<crate::driver::manifest::v1::DocRole>) -> Self {
-        let mut s = Self::default();
-        for (ix, role) in roles.iter().enumerate() {
+impl<I: Iterator<Item = (String, Role)>> From<I> for Roles {
+    fn from(roles: I) -> Self {
+       let mut s = Self::default();
+        for (ix, (key, role)) in roles.into_iter().enumerate() {
             let id = RoleID(0, 0, 2 + ix as u8);
-            s.map.insert(role.id.clone(), id.clone());
+            s.map.insert(key, id);
             s.storage.insert(id.clone(), Role { 
-                label: role.label.clone(), 
-                id: id
+                label: role.label, 
+                inlining_behavior: role.inlining_behavior.map(|b| b.into())
             });
         }
         s
     }
+}
 
+impl Roles {
     pub fn get_by_key(&self, key: &str) -> Option<&Role> {
         self.map
             .get_by_left(key)
@@ -335,24 +381,263 @@ impl Roles {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Relationship {
-    Member
+#[derive(Clone, Debug, PartialEq, Hash, Eq)]
+pub struct Relationship(Cow<'static, str>);
+
+
+impl Relationship {
+    pub const fn predefined(identifier: &'static str) -> Self {
+        Self(Cow::Borrowed(identifier))
+    }
+
+    pub const Owner: Self = Self::predefined("owns");
+    pub const Member: Self = Self::predefined("member");
+    pub const Related: Self = Self::predefined("rel");
 }
+
+impl FromStr for Relationship {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Cow::Owned(s.to_owned())))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttributeAppearance {
+    Modifier,
+    Annotation,
+    Caption,
+    Admonition,
+    Hidden,
+}
+
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub label: String,
+    pub repeatable: bool,
+    pub value_type: ValueType,
+    pub appearance: AttributeAppearance,
+    pub description: Option<RichText>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AttributeID(usize);
+
+#[derive(Clone, Debug, Default)]
+pub struct AttributeValues<'a>(Vec<(AttributeID, Value<'a>)>);
+
+impl<'a> AttributeValues<'a> {
+    pub fn get_attribute_mut(&mut self, id: AttributeID) -> Option<&mut Value<'a>> {
+        self.0.iter_mut().find(|(a,_)| *a == id).map(|(_, v)| v)
+    }
+
+    pub fn get_attribute(&self, id: AttributeID) -> Option<Value<'a>> {
+        self.0.iter().find(|(a,_)| *a == id).map(|(_, v)| v.clone())
+    }
+
+    pub fn get_attributes(&self, id: AttributeID) -> Vec<Value<'a>> {
+        self.0.iter().filter(|(a,_)| *a == id).map(|(_, v)| v.clone()).collect()
+    }
+
+    pub fn get_attributes_mut(&mut self, id: AttributeID) -> Vec<&mut Value<'a>> {
+        self.0.iter_mut().filter(|(a,_)| *a == id).map(|(_, v)| v).collect()
+    }
+
+    pub fn set_attribute(&mut self, id: AttributeID, value: Value<'a>) {
+        if let Some(existing_value) = self.get_attribute_mut(id) {
+            *existing_value = value;
+        } else {
+            self.0.push((id, value));
+        }
+    }
+
+    pub fn add_attribute(&mut self, id: AttributeID, value: Value<'a>) {
+        self.0.push((id, value));
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Attributes {
+    storage: Vec<Attribute>,
+    map: BiMap<String, AttributeID>,
+}
+
+impl Default for Attributes {
+    fn default() -> Self {
+        Self {
+            storage: Vec::new(),
+            map: BiMap::new(),
+        }
+    }
+}
+
+impl<I: Iterator<Item = (String, Attribute)>> From<I> for Attributes {
+    fn from(attributes: I) -> Self {
+        let mut s = Self::default();
+        for (ix, (key, attr)) in attributes.enumerate() {
+            let id = AttributeID(ix);
+            s.map.insert(key, id);
+            s.storage.push(attr.into());
+        }
+        s
+    }
+}
+
+impl Attributes {
+    pub fn get_by_key(&self, key: &str) -> Option<&Attribute> {
+        self.map
+            .get_by_left(key)
+            .map(|id| self.storage.get(id.0))
+            .flatten()
+    }
+
+    pub fn get_by_id(&self, id: AttributeID) -> Option<&Attribute> {
+        self.storage.get(id.0)
+    }
+
+    pub fn id_for_key(&self, key: &str) -> Option<AttributeID> {
+        Some(self.map.get_by_left(key)?.clone())
+    }
+
+    pub fn key_for_id(&self, id: AttributeID) -> Option<&str> {
+        Some(self.map.get_by_right(&id)?.as_str())
+    }
+}
+
+// #[derive(Debug, Clone)]
+// pub struct Aspect {
+//     pub label: String,
+//     pub help: Option<RichText>,
+//     pub items_ordered: bool,
+//     pub items_labelled: bool,
+//     pub items_referenced: bool,
+// }
+
+// #[derive(Debug, Clone)]
+// pub struct AspectItem {
+//     pub label: Option<String>,
+//     pub reference: Option<String>,
+//     pub attributes: AttributeValues,
+//     pub description: RichText,
+// }
+
+// #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// pub struct AspectID(usize);
+
+// #[derive(Clone, Debug, Default)]
+// pub struct AspectItems(HashMap<AspectID, Vec<AspectItem>>);
+
+// impl AspectItems {
+//     pub fn get_attribute_mut(&mut self, id: AttributeID) -> Option<&mut Value> {
+//         self.0.iter_mut().find(|(a,_)| *a == id).map(|(_, v)| v)
+//     }
+
+//     pub fn get_attribute(&self, id: AttributeID) -> Option<Value> {
+//         self.0.iter().find(|(a,_)| *a == id).map(|(_, v)| v.clone())
+//     }
+
+//     pub fn get_attributes(&self, id: AttributeID) -> Vec<Value> {
+//         self.0.iter().filter(|(a,_)| *a == id).map(|(_, v)| v.clone()).collect()
+//     }
+
+//     pub fn get_attributes_mut(&mut self, id: AttributeID) -> Vec<&mut Value> {
+//         self.0.iter_mut().filter(|(a,_)| *a == id).map(|(_, v)| v).collect()
+//     }
+
+//     pub fn set_attribute(&mut self, id: AttributeID, value: Value) {
+//         if let Some(existing_value) = self.get_attribute_mut(id) {
+//             *existing_value = value;
+//         } else {
+//             self.0.push((id, value));
+//         }
+//     }
+
+//     pub fn add_attribute(&mut self, id: AttributeID, value: Value) {
+//         self.0.push((id, value));
+//     }
+// }
+
+// #[derive(Clone, Debug)]
+// pub struct Aspects {
+//     storage: Vec<Aspect>,
+//     map: BiMap<String, AspectID>,
+// }
+
+// impl Default for Aspects {
+//     fn default() -> Self {
+//         Self {
+//             storage: Vec::new(),
+//             map: BiMap::new(),
+//         }
+//     }
+// }
+
+// impl From<Vec<crate::driver::manifest::v1::DocAspect>> for Aspects {
+//     fn from(aspects: Vec<crate::driver::manifest::v1::DocAspect>) -> Self {
+//         Self::from_manifest_v1(aspects)
+//     }
+// }
+
+// impl Aspects {
+//     pub fn from_manifest_v1(attributes: Vec<crate::driver::manifest::v1::DocAspect>) -> Self {
+//         let mut s = Self::default();
+//         for (ix, aspect) in attributes.into_iter().enumerate() {
+//             let id = AspectID(ix);
+//             s.map.insert(aspect.id.clone(), id);
+//             s.storage.push(aspect.into());
+//         }
+//         s
+//     }
+
+//     pub fn get_by_key(&self, key: &str) -> Option<&Aspect> {
+//         self.map
+//             .get_by_left(key)
+//             .map(|id| self.storage.get(id.0))
+//             .flatten()
+//     }
+
+//     pub fn get_by_id(&self, id: AspectID) -> Option<&Aspect> {
+//         self.storage.get(id.0)
+//     }
+
+//     pub fn id_for_key(&self, key: &str) -> Option<AspectID> {
+//         Some(self.map.get_by_left(key)?.clone())
+//     }
+
+//     pub fn key_for_id(&self, id: AspectID) -> Option<&str> {
+//         Some(self.map.get_by_right(&id)?.as_str())
+//     }
+// }
 
 pub struct EntryGraph {
     pub roles: Roles,
-    pub attributes: HashMap<String, Attribute>,
-    entries: HashMap<String, Entry>,
+    pub attributes: Attributes,
+    // pub aspects: Aspects,
+    entries: HashMap<String, (Entry, NodeIndex)>,
     relationships: DiGraph<String, Relationship>,
     root: String,
 }
 
 impl EntryGraph {
-    pub fn new() -> Self {
+    fn root_id(&self) -> &str {
+        &self.root
+    }
+
+    fn root_mut(&mut self) -> &mut Entry {
+        self.get_entry_mut(&self.root_id().to_string()).expect("fatal error: root entry not found")
+    }
+
+    fn root(&mut self) -> &Entry {
+        self.get_entry(self.root_id()).expect("fatal error: root entry not found")
+    }
+
+    pub fn new(roles: Roles, attributes: Attributes) -> Self {
         Self {
-            roles: Roles::default(),
-            attributes: HashMap::new(),
+            roles,
+            attributes,
+            // aspects: Aspects::default(),
+            relationships: DiGraph::new(),
             entries: HashMap::with_capacity(DEFAULT_ENTRY_CAPACITY),
             root: "root.default".into()
         }
@@ -364,12 +649,41 @@ impl EntryGraph {
     }
 
     pub fn add_entry<'a>(&'a mut self, id: &str, title: String) -> &'a mut Entry {
-        self.entries.insert(id.into(), Entry::named(title));
-        self.entries.get_mut(id).expect("fatal error: Entry ID not found")
+        let ix = self.relationships.add_node(id.into());
+        self.entries.insert(id.into(), (Entry::named(title), ix));
+        let entry = &mut self.entries.get_mut(id).expect("fatal error: Entry ID not found").0;
+        entry.graph_id = Some(ix);
+        entry
     }
 
-    pub fn get_entry<'a>(&'a mut self, id: &str) -> Option<&'a mut Entry> {
-        self.entries.get_mut(id)
+    pub fn get_entry_mut<'a>(&'a mut self, id: &str) -> Option<&'a mut Entry> {
+        self.entries.get_mut(id).map(|(e,_)| e)
+    }
+
+     pub fn get_entry<'a>(&'a self, id: &str) -> Option<&'a Entry> {
+        self.entries.get(id).map(|(e,_)| e)
+    }
+
+    pub fn add_relationship(&mut self, from: &Entry, to: &Entry, kind: Relationship) {
+        self.relationships.add_edge(
+            from.graph_id.expect("fatal error: must not add relationship from entry not connected to graph"), 
+            to.graph_id.expect("fatal error: must not add relationship to entry not connected to graph"), 
+            kind
+        );
+    }
+
+    pub fn add_membership(&mut self, member: &Entry, entry: &Entry) {
+        let member_id = member.graph_id.expect("fatal error: must not add relationship from entry not connected to graph");
+        let entry_id = entry.graph_id.expect("fatal error: must not add relationship to entry not connected to graph");
+        let has_owner = self.relationships
+            .edges_directed(member_id, Incoming)
+            .find(|r| *r.weight() == Relationship::Owner).is_some();
+
+        if !has_owner {
+            self.relationships.add_edge(member_id, entry_id, Relationship::Owner);
+        }
+
+        self.relationships.add_edge(entry_id, member_id, Relationship::Member);
     }
 
 }

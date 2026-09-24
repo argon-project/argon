@@ -16,6 +16,7 @@ pub enum Symbol {
     structure(Struct),
     union(Union),
     enumeration(Enum),
+    enumerationCase(EnumCase),
     macroDefintion(MacroDefinition),
     // header(TranslationUnit),
     // source(TranslationUnit),
@@ -29,6 +30,7 @@ impl Symbol {
             Self::typeDefinition(definition) => definition.originalType.decl.likeness(),
             Self::structure(_) | Self::union(_) => SymbolLikeness::Structure,
             Self::enumeration(_) => SymbolLikeness::Enumeration,
+            Self::enumerationCase(_) => SymbolLikeness::EnumerationCase,
             Self::macroDefintion(definition) => if definition.parameters.is_empty() {
                 SymbolLikeness::Constant
             } else {
@@ -86,7 +88,7 @@ pub struct MacroDefinition {
     pub value: Option<RawSpelling>
 }
 
-#[derive(Clone, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
+#[derive(Clone, PartialEq, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
 pub enum Storage {
     #[strum(serialize = "extern")]
     r#extern,
@@ -111,7 +113,7 @@ pub enum Storage {
 }
 
 /// Declaration modifier
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum Modifier {
     /// Storage class modifier
     storage(Storage),
@@ -126,7 +128,7 @@ pub enum Modifier {
     msSpecificModifier(MSDeclModifier),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum MSDeclModifier {
     /// `__declspec` modifier
     declspec(Identifier),
@@ -144,7 +146,7 @@ pub enum DeclarationQualifier {
     alignas(Expression),
 }
 
-#[derive(Clone, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
+#[derive(Clone, PartialEq, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
 pub enum PointerQualifier {
     /// Not null, applies to pointers only
     #[strum(serialize = "_Nonnull")]
@@ -179,7 +181,7 @@ pub enum ArrayQualifier {
     restrict,
 }
 
-#[derive(Clone, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
+#[derive(Clone, PartialEq, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
 pub enum TypeQualifier {
     /// Immutable value, applies to types
     #[strum(serialize = "const")]
@@ -194,12 +196,18 @@ pub enum TypeQualifier {
     atomic,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Attribute {
     pub arguments: Vec<RawSpelling>, // TODO: more detail?
 }
 
-#[derive(Clone)]
+impl Attribute {
+    pub fn keyword(keyword: &str) -> Self {
+        Self { arguments: vec![keyword.to_string()] }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct StandardAttribute {
     pub prefix: Option<Identifier>,
     pub name: Identifier,
@@ -269,6 +277,12 @@ pub enum SizeModifier {
 pub struct CType {
     pub decl: Box<TypeDecl>,
     pub qualifiers: Vec<TypeQualifier>,
+}
+
+impl CType {
+    pub fn decl(&self) -> &TypeDecl {
+        &self.decl
+    }
 }
 
 #[derive(Clone, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
@@ -412,6 +426,31 @@ pub struct Variable {
     pub attachedExpression: Option<AttachedExpression>,
 }
 
+impl crate::ir::Variable for Variable {
+    fn identifier(&self) -> Option<&str> {
+        self.identifier.as_deref()
+    }
+
+    fn constant(&self) -> bool {
+        self.cType.qualifiers.contains(&TypeQualifier::r#const)
+    }
+
+    fn nullable(&self) -> Option<bool> {
+        match self.cType.decl() {
+            TypeDecl::pointer(pointer) =>
+                if pointer.qualifiers.contains(&PointerQualifier::nullable) {
+                    Some(true)
+                } else if pointer.qualifiers.contains(&PointerQualifier::nonnull) || 
+                    self.modifiers.contains(&Modifier::attribute(Attribute::keyword("nonnull"))) {
+                    Some(false)
+                } else {
+                    None
+                }
+            _ => None
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Container {
     pub name: Option<Identifier>,
@@ -445,6 +484,36 @@ pub struct Enum {
 pub enum Parameter<R> {
     variadic(Option<Identifier>),
     regular(R),
+}
+
+impl crate::ir::Variable for Parameter<Variable> {
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::regular(v) => v.identifier(),
+            Self::variadic(i) => i.as_deref()
+        }
+    }
+
+    fn variadic(&self) -> bool {
+        match self {
+            Self::regular(_) => false,
+            Self::variadic(_) => true
+        }
+    }
+
+    fn constant(&self) -> bool {
+        match self {
+            Self::regular(v) => v.constant(),
+            Self::variadic(_) => false
+        }
+    }
+
+    fn nullable(&self) -> Option<bool> {
+        match self {
+            Self::regular(v) => v.nullable(),
+            Self::variadic(_) => None
+        }
+    }
 }
 
 #[derive(Clone, EnumString, strum_macros::Display, strum_macros::AsRefStr)]
@@ -579,6 +648,7 @@ impl fmt::Display for Symbol {
             Self::structure(x) => write!(f, "struct {x}"),
             Self::union(x) => write!(f, "union {x}"),
             Self::enumeration(x) => write!(f, "{x}"),
+            Self::enumerationCase(x) => write!(f, "{x}"),
             Self::macroDefintion(x) => write!(f, "{x}"),
             // Self::header(x) => write!(f, "{x}"),
             // Self::source(x) => write!(f, "{x}"),

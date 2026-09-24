@@ -1,11 +1,12 @@
 use std::{
-    num::ParseIntError, path::PathBuf
+    borrow::Cow, num::ParseIntError, path::PathBuf
 };
+use enum_assoc::Assoc;
+use serde::{Deserialize, Serialize};
 use strum_macros::AsRefStr;
 use crate::{ 
-    backend, 
-    ir::{
-        self, entry_graph::{AttributeLookupError, EntryLookupError, RoleLookupError}, rich_text::RichTextRepresentation, Entry, EntryGraph, Language, MemberSection, RichText
+    backend, compiler::{diagnostics::{self, DiagnosticReporter}, strings::{self, CowStr}}, frontend, ir::{
+        self, Entry, EntryGraph, Language, MemberSection, RichText, entry_graph::{AttributeLookupError, EntryLookupError, RoleLookupError}, rich_text::{self, RichTextRepresentation}
     }
 };
 
@@ -16,55 +17,118 @@ use super::arguments::{
     ArgumentValueError,
 };
 
-#[derive(enum_assoc::Assoc, Clone, Debug)]
+use serde_variant::to_variant_name;
+
+const fn _true() -> bool { true }
+
+pub type Script<'a, Builtin> = Vec<Action<'a, Builtin>>;
+
+#[derive(Clone, Debug, Assoc)]
 #[func(pub const fn id(&self) -> &'static str)]
-pub enum Action<Builtin> {
+pub enum Action<'a, Builtin> {
 
     #[assoc(id = "builtin")]
     Builtin(Builtin),
 
+    #[assoc(id = "script")]
+    Script(CowStr<'a>),
+
+    #[assoc(id = "parameter.set")]
+    SetParameter {
+        argument: Parameter<CowStr<'a>>,
+        value: Parameter<ir::Value<'a>>,
+    },
+
     /// Creates a new entry and opens new scope for this entry
-    #[assoc(id = "graph.entry.create")]
+    #[assoc(id = "graph.entry+")]
     CreateEntry {
         /// Entry identifier
-        id: Parameter<String>,
+        id: Parameter<CowStr<'a>>,
 
         // Title of entry
-        title: Parameter<String>,
+        title: Parameter<CowStr<'a>>,
 
         content: Parameter<Option<RichText>>,
-
-        continue_content: bool 
     },
 
     /// Parses, generates sema, and attaches symbol to current entry.
     /// 
     /// To create a new entry with this symbol, invoke [``Action::CreateEntry``]
     /// before. And set its role using [``Action::SetRole``] to [``ir::Role``]
-    #[assoc(id = "entry.symbol.add")]
+    #[assoc(id = "entry.symbol+")]
     AddSymbol {
-        raw: Parameter<String>,
+        raw: Parameter<CowStr<'a>>,
         language: Parameter<Language>
     },
 
     /// Creates a member section with members of the scoped opened next
-    #[assoc(id = "entry.member-section.create")]
+    #[assoc(id = "entry.member-section+")]
     CreateMemberSection {
-        title: Parameter<String>,
+        title: Parameter<CowStr<'a>>,
 
         content: Parameter<Option<RichText>>,
-
-        continue_content: bool,
     },
 
-    /// Moves content of the scope opened next to entry with specified ID
-    #[assoc(id = "move-to-entry")]
-    MoveToEntry {
-        entry_id: Parameter<String>,
+    #[assoc(id = "scope.push")]
+    PushScope {
+        name: Parameter<Option<CowStr<'a>>>,
+    },
 
-        content: Parameter<Option<RichText>>,
+    #[assoc(id = "scope.pop")]
+    PopScope {
+        name: Parameter<Option<CowStr<'a>>>,
+    },
 
-        continue_content: bool,
+    #[assoc(id = "scope.boundary.apply")]
+    SetScopeBoundary {
+        beyond_comment: Parameter<bool>
+    },
+
+
+    #[assoc(id = "scope.entry.set")]
+    SetEntry {
+        entry_id: Parameter<CowStr<'a>>,
+    },
+
+
+    #[assoc(id = "scope.attribute.apply")]
+    ApplyAttribute {
+        key: Parameter<CowStr<'a>>,
+        value: Parameter<ir::Value<'a>>,
+    },
+
+    #[assoc(id = "scope.output.allow")]
+    AddAllowedOutputBackend {
+        allowed: Parameter<backend::Format>
+    },
+
+    #[assoc(id = "scope.output.disallow")]
+    AddDisallowedOutputBackend {
+        disallowed: Parameter<backend::Format>
+    },
+
+    /// Insert contents of scope opened next into specified output
+    /// 
+    /// Treats everything that follows as verbatim output until a command
+    /// with a matching [`Self::PopScope`] action is found. Syntax in between
+    /// that is a valid command is ignored unless it is the one containing
+    /// [`Self::PopScope`] or one that has [`Self::Include`] with a matching
+    /// language that can be included in the output.
+    #[assoc(id = "scope.language.set")]
+    SetScopeLanguage {
+        language: Parameter<ir::Language>,
+    },
+
+    #[assoc(id = "diagnose")]
+    Diagnose {
+        level: Parameter<ir::DiagnosticLevel>,
+        message: Parameter<CowStr<'a>>,
+    },
+
+    #[assoc(id = "entry.appearance.option.add")]
+    SetDisplayOption {
+        name: Parameter<CowStr<'a>>,
+        value: Parameter<ir::Value<'a>>
     },
 
     /// Indicates membership of current entry
@@ -72,7 +136,16 @@ pub enum Action<Builtin> {
     /// If membership is added multiple times, the first membership constitues ownership.
     #[assoc(id = "entry.membership.add")]
     AddMembership {
-        entry_id: Parameter<String>,
+        entry_id: Parameter<CowStr<'a>>,
+    },
+
+    /// Indicates membership of current entry
+    /// 
+    /// If membership is added multiple times, the first membership constitues ownership.
+    #[assoc(id = "entry.relationship.add")]
+    AddRelationship {
+        kind: Parameter<ir::Relationship>,
+        entry_id: Parameter<CowStr<'a>>,
     },
 
     /// Sets abstract text of current entry
@@ -84,24 +157,24 @@ pub enum Action<Builtin> {
     /// Sets attribute on current entry
     #[assoc(id = "entry.attribute.add")]
     AddAttribute {
-        key: Parameter<String>,
-        value: Parameter<ir::Value>,
+        key: Parameter<CowStr<'a>>,
+        value: Parameter<ir::Value<'a>>,
     },
 
     /// Sets role of current entry
     #[assoc(id = "entry.role.set")]
     SetRole {
-        role: Parameter<String>
+        role: Parameter<CowStr<'a>>
     },
 
     /// Sets this entry as the root entry
-    #[assoc(id = "graph.root.set-this")]
+    #[assoc(id = "graph.root.set")]
     SetRootEntry,
 
     /// Assigns current symbol to other entry
-    #[assoc(id = "symbol.assign-to-entry")]
+    #[assoc(id = "entry.symbol.add")]
     AssignSymbol {
-        entry_id: Parameter<String>,
+        entry_id: Parameter<CowStr<'a>>,
     },
 
     /// Sets symbol help text of current symbol
@@ -113,86 +186,165 @@ pub enum Action<Builtin> {
     /// Sets symbol heading of current symbol
     #[assoc(id = "symbol.heading.set")]
     SetSymbolHeading {
-        content: Parameter<String>
+        content: Parameter<CowStr<'a>>
     },
 
     /// Adds section item, such as parameter or return value
     #[assoc(id = "entry.section.items.add")]
     AddSectionItem {
-        kind: ir::CharacteristicSection,
+        kind: Parameter<ir::CharacteristicSection>,
         value: Parameter<ir::RichText>,
         description: Parameter<ir::RichText>,
-        modifier: Parameter<Vec<ir::Modifier>>,
     },
 
     /// Sets abstract paragraph of section, such as return value or throws
     #[assoc(id = "entry.section.abstract.set")]
     SetSectionAbstract {
-        kind: ir::CharacteristicSection,
+        kind: Parameter<ir::CharacteristicSection>,
         content: Parameter<ir::RichText>,
     },
 
     /// Inserts rich text
-    #[assoc(id = "block.insert-admonition")]
+    #[assoc(id = "block.admonition")]
     InsertAdmonition {
-        contents: Parameter<ir::RichText>
+        contents: Parameter<ir::RichText>,
+        kind: Parameter<ir::AdmonitionKind>
     },
 
-    #[assoc(id = "inline.insert-text")]
+    #[assoc(id = "block.code")]
+    InsertCodeBlock {
+        contents: Parameter<CowStr<'a>>,
+        language: Parameter<Option<ir::Language>>,
+    },
+
+    #[assoc(id = "block.code.snippet")]
+    InsertSnippet {
+        // TODO: Like DocC snippets, document that here...
+        source: Parameter<PathBuf>,
+        language: Parameter<Option<ir::Language>>,
+        snippet: Parameter<Option<CowStr<'a>>>
+    },
+
+    #[assoc(id = "block.code.start")]
+    StartCodeBlock {
+        language: Parameter<Option<ir::Language>>,
+    },
+
+    #[assoc(id = "block.code.end")]
+    EndCodeBlock {
+        
+    },
+
+
+    #[assoc(id = "image")]
+    InsertImage {
+        // https://www.swift.org/documentation/docc/adding-images
+        image_source: Parameter<PathBuf>,
+        caption: Parameter<Option<ir::RichText>>,
+        inline: Parameter<bool>,
+        id: Parameter<Option<CowStr<'a>>>,
+    },
+
+    #[assoc(id = "block.video")]
+    InsertVideo {
+        // https://www.swift.org/documentation/docc/video
+        video_source: Parameter<PathBuf>,
+        poster_source: Parameter<PathBuf>,
+        caption: Parameter<Option<ir::RichText>>,
+        id: Parameter<Option<CowStr<'a>>>,
+    },
+
+    #[assoc(id = "block.audio")]
+    InsertAudio {
+        audio_source: Parameter<PathBuf>,
+        caption: Parameter<Option<ir::RichText>>,
+        id: Parameter<Option<CowStr<'a>>>,
+    },
+
+    #[assoc(id = "headline")]
+    InsertHeadline {
+        id: Parameter<Option<CowStr<'a>>>,
+        level: Parameter<u8>,
+        content: Parameter<ir::RichText>
+    },
+
+    #[assoc(id = "list.item")]
+    InsertListItem {
+        style: Parameter<rich_text::ListStyle>,
+        content: Parameter<ir::RichText>
+    },
+
+    #[assoc(id = "inline.styled")]
+    InsertStyled {
+        text: Parameter<CowStr<'a>>,
+        style: Parameter<ir::rich_text::InlineTextStyle>
+    },
+
+    #[assoc(id = "inline.text")]
     InsertText {
-        text: Parameter<String>,
+        text: Parameter<CowStr<'a>>,
     },
 
-    #[assoc(id = "inline.insert")]
-    Insert {
-        content: Parameter<Option<ir::RichText>>,
-        continue_content: bool,
+    #[assoc(id = "inline.emoji")]
+    InsertEmoji {
+        name: Parameter<CowStr<'a>>,
     },
 
-    /// Insert contents of scope opened next into specified output
-    #[assoc(id = "inline.insert-with-output-restriction")]
-    InsertOnlyIntoOutput {
-        format: backend::Format,
-        content: Parameter<Option<ir::RichText>>,
-        continue_content: bool,
+    #[assoc(id = "inline.code")]
+    InsertCode {
+        content: Parameter<CowStr<'a>>,
+        language: Parameter<Option<ir::Language>>,
     },
 
-    /// Insert into specified output from file
-    #[assoc(id = "inline.insert-from-file")]
-    InsertIntoOutputFromFile {
-        format: backend::Format,
-        file: Parameter<PathBuf>
-    },
 
-    #[assoc(id = "inline.insert-reference")]
+    #[assoc(id = "inline.reference")]
     /// Inserts reference to another entry with specified id
     InsertReference {
-        entry_id: Parameter<String>
+        entry_id: Parameter<CowStr<'a>>
+    },
+
+    #[assoc(id = "inline")]
+    Insert {
+        content: Parameter<Option<ir::RichText>>,
+    },
+
+    #[assoc(id = "embed.file")]
+    EmbedFromFile {
+        language: Parameter<Option<ir::Language>>,
+        source: Parameter<PathBuf>,
+    },
+
+    #[assoc(id = "embed")]
+    Embed {
+        language: Parameter<Option<ir::Language>>,
+        content: Parameter<CowStr<'a>>,
     },
 }
 
-impl<'a, Builtin> Into<&'static str> for &'a Action<Builtin> where &'a Builtin: Into<&'static str> {
-    fn into(self) -> &'static str {
+impl<'a, Builtin> Into<CowStr<'a>> for &'a Action<'a, Builtin> where &'a Builtin: Into<CowStr<'a>>, Self: Serialize, Builtin: Serialize {
+
+    fn into(self) -> CowStr<'a> {
         match self {
-            Action::Builtin(builtin) => builtin.into(),
-            action => action.id()
+            Action::Builtin(builtin) => format!("builtin.{}", to_variant_name(builtin).unwrap()).into(),
+            Action::Script(name) => format!("script.{}", name.as_ref()).into(),
+            _ => to_variant_name(&self).unwrap().into()
         }
     }
 }
 
-impl<'a, Builtin> Action<Builtin> where &'a Builtin: Into<&'static str>, Self: 'a {
-    pub fn action_identifier(&'a self) -> &'static str {
-        self.into()
-    }
-}
-
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ActionError {
     #[error(transparent)]
     ArgumentValueFailure(#[from] ArgumentValueError<ParseIntError>),
 
     #[error(transparent)]
     ArgumentValueFailure2(#[from] ArgumentValueError),
+
+    #[error(transparent)]
+    ArgumentValueFailure3(#[from] ArgumentValueError<strum::ParseError>),
+
+    #[error(transparent)]
+    LanguageError(#[from] frontend::LanguageError),
 
     #[error(transparent)]
     RoleLookupFailure(#[from] RoleLookupError),
@@ -212,16 +364,19 @@ pub enum ActionError {
 
 pub trait ActionExecutor<'a> {
     type BuiltinAction;
+    type D : diagnostics::DiagnosticReporter;
 
     fn graph(&mut self) -> Result<&'a mut EntryGraph, ActionError>;
 
-    fn execute_builtin(&mut self, action: Self::BuiltinAction) -> Result<(), ActionError>;
+    fn execute_builtin(&mut self, action: &Self::BuiltinAction) -> Result<(), ActionError>;
 
     fn enter_entry_scope(&mut self, entry: &mut Entry, id: &str) -> Result<(), ActionError>;
     fn leave_entry_scope(&mut self, entry: &mut Entry, id: &str) -> Result<(), ActionError>;
 
     fn current_entry(&mut self, purpose: &'static str) -> Result<(&'a mut Entry, String), ActionError>;
 
+    fn enter_member_section(&mut self, section: &mut MemberSection) -> Result<(), ActionError>;
+    fn leave_member_section(&mut self, section: &mut MemberSection) -> Result<(), ActionError>;
     fn current_member_section(&mut self) -> Result<&'a MemberSection, ActionError>;
 
     fn current_content(&mut self) -> Result<&mut RichText, ActionError>;
@@ -236,7 +391,11 @@ pub trait ActionExecutor<'a> {
         Ok(())
     }
 
-    fn execute(&mut self, action: Action<Self::BuiltinAction>, arguments: Arguments) -> Result<(), ActionError> {
+    fn default_diags(&self) -> &Self::D;
+
+    fn language_config(&self) -> &frontend::LanguageSettings;
+
+    fn execute<'b>(&mut self, action: &Action<'a, Self::BuiltinAction>, arguments: &'b mut Arguments<'b>) -> Result<(), ActionError> where 'a : 'b {
         match action {
             Action::Builtin(builtin) => 
                 self.execute_builtin(builtin),
@@ -244,9 +403,8 @@ pub trait ActionExecutor<'a> {
                 id, 
                 title, 
                 content,
-                continue_content
             } => {
-                let mut arguments = arguments;
+                let arguments = arguments;
                 let content = arguments.resolve_rich_text_optional(
                     content, 
                     self.preferred_rich_text_representation()
@@ -255,7 +413,7 @@ pub trait ActionExecutor<'a> {
                 let title = arguments.resolve_str(&title)?;
                 let entry = self.graph()?.add_entry(&id, title.into());
                 
-                if content.is_some() || continue_content {
+                if content.is_some() {
                     self.enter_entry_scope(entry, &id)?;
                 }
 
@@ -266,60 +424,83 @@ pub trait ActionExecutor<'a> {
                     Ok(())
                 };
 
-                if !continue_content {
-                    self.leave_entry_scope(entry, &id)?;
-                }
+                // if !continue_content {
+                //     self.leave_entry_scope(entry, &id)?;
+                // }
 
                 res?;
                 Ok(())
             }
-            Action::MoveToEntry { 
-                entry_id,
-                content,
-                continue_content
-            } => {
-                let mut arguments = arguments;
-                let content = arguments.resolve_rich_text_optional(
-                    content, 
-                    self.preferred_rich_text_representation()
-                );
-                let id = arguments.resolve_str(&entry_id)?;
+            // Action::MergeInto { 
+            //     entry_id,
+            //     content,
+            //     continue_content
+            // } => {
+            //     let arguments = arguments;
+            //     let content = arguments.resolve_rich_text_optional(
+            //         content, 
+            //         self.preferred_rich_text_representation()
+            //     );
+            //     let id = arguments.resolve_str(&entry_id)?;
 
-                let entry = self.graph()?
-                    .get_entry(&id)
-                    .ok_or_else(|| EntryLookupError::UnknownEntryID(id.clone().into_string()))?;
+            //     let entry = self.graph()?
+            //         .get_entry_mut(&id)
+            //         .ok_or_else(|| EntryLookupError::UnknownEntryID(id.clone().into_string()))?;
 
-                if content.is_some() || continue_content {
-                    self.enter_entry_scope(entry, &id)?;
-                }
+            //     if content.is_some() || continue_content {
+            //         self.enter_entry_scope(entry, &id)?;
+            //     }
 
-                let res =
-                if let Some(content) = content {
-                    self.insert_content(content)
-                } else {
-                    Ok(())
-                };
+            //     let res =
+            //     if let Some(content) = content {
+            //         self.insert_content(content)
+            //     } else {
+            //         Ok(())
+            //     };
 
-                if !continue_content {
-                    self.leave_entry_scope(entry, &id)?;
-                }
+            //     if !continue_content {
+            //         self.leave_entry_scope(entry, &id)?;
+            //     }
 
-                res?;
-                Ok(())
-            }
+            //     res?;
+            //     Ok(())
+            // }
             Action::CreateMemberSection { 
                 title, 
                 content, 
-                continue_content 
             } => {
-                let mut arguments = arguments;
+                let arguments = arguments;
                 let content = arguments.resolve_rich_text_optional(
                     content, 
                     self.preferred_rich_text_representation()
                 );
                 let title = arguments.resolve_str(&title)?;
 
-                self.current_entry("create member section")?.0;
+                let entry = self.current_entry("create member section")?.0;
+
+                let section = entry.add_member_section(title.into_string(), None);
+            
+                if content.is_some() {
+                    self.enter_member_section(section)?;
+                }
+
+                let res =
+                if let Some(content) = content {
+                    self.insert_content(content)
+                } else {
+                    Ok(())
+                };
+
+                res?;
+                Ok(())
+            }
+            Action::AddSectionItem { 
+                kind, 
+                value: content, 
+                description, 
+            } => {
+                let kind = arguments.resolve_parsed(kind)?;
+
 
                 Ok(())
             }
@@ -335,38 +516,84 @@ pub trait ActionExecutor<'a> {
                 Ok(())
             }
             Action::AddAttribute { key, value } => {
-                let mut arguments = arguments;
+                let arguments = arguments;
                 let key = arguments.resolve_str(&key)?.into_string();
-                let attribute = self.graph()?.attributes.get(&key)
+                let graph = self.graph()?;
+                let attribute_id = graph.attributes.id_for_key(&key)
                     .ok_or_else(|| AttributeLookupError::UnknownAttributeKey(key.clone()))?;
 
-                let value = arguments.resolve_converted(value, attribute.value_type)?;
+                let attribute = graph.attributes.get_by_id(attribute_id)
+                    .ok_or_else(|| AttributeLookupError::UnknownAttributeKey(key.clone()))?;
+
+                let value = arguments.resolve_converted(value, attribute.value_type)?.into_static();
 
                 let entry = self.current_entry("add attribute")?.0;
                 
                 if attribute.repeatable {
-                    entry.add_attribute(key, value);
+                    entry.attributes.add_attribute(attribute_id, value);
                 } else {
-                    entry.set_attribute(key, value);
+                    entry.attributes.set_attribute(attribute_id, value);
                 }
                 Ok(())
             }
             Action::AddMembership { entry_id } => {
-                let graph = self.graph()?;
                 let id = arguments.resolve_str(&entry_id)?;
-                let entry = graph.get_entry(&id)
+                let entry = self.graph()?.get_entry(&id)
                     .ok_or_else(|| EntryLookupError::UnknownEntryID(id.clone().into()))?;
 
-                if !entry.can_add_member(self.current_entry("get role")?.0.role) {
+                let current_entry = self.current_entry("add membership")?.0;
+                if !entry.can_add_member(current_entry.role) {
                     return Err(ActionError::LeafEntry(entry.title.clone()))
                 }
-                entry.add_member(id.into_string());
+                
+                self.graph()?.add_membership(current_entry, entry);
+                Ok(())
+            }
+            Action::AddRelationship { kind, entry_id } => {
+                let id = arguments.resolve_str(&entry_id)?;
+                let kind = arguments.resolve_parsed(kind)?;
+                let entry = self.graph()?.get_entry(&id)
+                    .ok_or_else(|| EntryLookupError::UnknownEntryID(id.clone().into()))?;
+
+                let current_entry = self.current_entry("add relationship")?.0;
+                
+                self.graph()?.add_relationship(current_entry, entry, kind);
                 Ok(())
             }
             Action::SetAbstract { content } => {
-                let mut arguments = arguments;
+                let arguments = arguments;
                 let abstract_ = arguments.resolve_rich_text(content, None)?;
                 self.current_entry("set abstract")?.0.set_abstract(abstract_);
+                _ = arguments;
+                Ok(())
+            }
+            Action::InsertAdmonition { 
+                contents,
+                kind
+            } => {
+                let kind = arguments.resolve_parsed(kind)?;
+                let contents = arguments.resolve_rich_text(contents, self.preferred_rich_text_representation())?;
+                self.process_content(contents.into_admonition(kind))?;
+                _ = arguments;
+
+                Ok(())
+            }
+            Action::AddSymbol { 
+                raw, 
+                language 
+            } => {
+                let language = arguments.resolve_parsed(language)?;
+                let raw = arguments.resolve_str(&raw)?;
+                let symbols = frontend::collect_language_symbols(
+                    language, 
+                    strings::Encoding::UTF8, 
+                    raw.as_bytes(), 
+                    self.language_config(), 
+                    self.default_diags()
+                )?;
+
+                self.current_entry("add symbol")?.0.add_symbols(symbols);
+                    
                 Ok(())
             }
             _ => {

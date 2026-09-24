@@ -1,14 +1,39 @@
-use std::{convert::Infallible, str::FromStr};
+use std::{borrow::Cow, convert::Infallible, str::FromStr};
+use fallible_iterator::{convert, FallibleIterator};
 
 use pulldown_cmark::{
-    CowStr, Event, Tag
+    BlockQuoteKind, Event, Tag
 };
-
+use serde::{Deserialize, Serialize};
+use strum_macros::EnumString;
 
 use crate::{
-    ir,
-    compiler::URL,
+    compiler::{URL, strings::CowStr}, ir,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq, EnumString)]
+pub enum ListStyle {
+    #[strum(serialize = "ordered")]
+    Ordered,
+
+    #[strum(serialize = "unordered")]
+    Unordered,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, EnumString)]
+pub enum InlineTextStyle {
+    #[strum(serialize = "emphasized")]
+    Emphasized,
+
+    #[strum(serialize = "bold")]
+    Bold,
+
+    #[strum(serialize = "strikethrough")]
+    Strikethrough,
+
+    #[strum(serialize = "underlined")]
+    Underlined,
+}
 
 // In the IR, we don't need to know what the original 'base format' was.
 // For instance, Doxygen, DocC, RustDoc, use Markdown as the base format.
@@ -44,7 +69,14 @@ impl CommonMark {
         Self(events)
     }
 
-    pub fn link(&self) -> Result<(URL, &str), LinkExtractionError> {
+    fn from_cow_str(s: CowStr) -> Self {
+        let cow: pulldown_cmark::CowStr = s.into();
+        Self::new(
+            vec![Event::Text(cow.into_static())]
+        )
+    }
+
+    pub fn link(&self) -> Result<(URL, CowStr<'static>), LinkExtractionError> {
         let mut links = self.0.iter().filter_map(|event| {
             if let Event::Start(Tag::Link { 
                 dest_url, 
@@ -66,35 +98,99 @@ impl CommonMark {
 
         let uri = URL::parse(&url)?;
 
-        Ok((uri, &title))
+        Ok((uri, title.clone().into()))
     }
 
     pub fn uri(&self) -> Result<URL, LinkExtractionError> {
         Ok(self.link()?.0)
     }
 
-    pub fn text(&self) -> impl Iterator<Item = &str> {
+    pub fn _text(&self) -> impl Iterator<Item = &pulldown_cmark::CowStr<'static>> {
         self.0.iter().filter_map(|event| {
             if let Event::Text(text) = event {
-                Some(text.as_ref())
+                Some(text)
             } else {
                 None
             }
         })
     }
 
-    pub fn str(&self) -> CowStr {
-        let mut iter = self.text();
+    pub fn str(&self) -> CowStr<'static> {
+        let mut iter = self._text();
         let Some(s) = iter.next() else {
             return CowStr::Borrowed("")
         };
 
         if let Some(s2) = iter.next() {
-            let string = iter.fold(s.to_string() + s2, |acc, s| acc + s);
-            return CowStr::Boxed(string.into_boxed_str())
+            let string = iter.fold(s.string() + s2, |acc, s| acc + s);
+            return CowStr::Owned(string)
         }
 
-        CowStr::Borrowed(s)
+        s.clone().into()
+    }
+
+    pub fn try_map_text<E>(&self, f: impl Fn(&str) -> Result<CowStr<'static>, E>) -> Result<Self, E> {
+        let events = convert(self.0.iter().map(|e| 
+            Ok(match e {
+                pulldown_cmark::Event::Text(s) => pulldown_cmark::Event::Text(f(&s)?.into()),
+                pulldown_cmark::Event::Code(s) => pulldown_cmark::Event::Code(f(&s)?.into()),
+                pulldown_cmark::Event::Html(s) => pulldown_cmark::Event::Html(f(&s)?.into()),
+                pulldown_cmark::Event::InlineHtml(s) => pulldown_cmark::Event::InlineHtml(f(&s)?.into()),
+                pulldown_cmark::Event::InlineMath(s) => pulldown_cmark::Event::InlineMath(f(&s)?.into()),
+                pulldown_cmark::Event::DisplayMath(s) => pulldown_cmark::Event::DisplayMath(f(&s)?.into()),
+                pulldown_cmark::Event::Start(tag) => 
+                    pulldown_cmark::Event::Start(match tag {
+                        pulldown_cmark::Tag::Heading { 
+                            level, 
+                            id, 
+                            classes, 
+                            attrs 
+                        } => pulldown_cmark::Tag::Heading { 
+                                level: level.clone(), 
+                                id: id.as_ref().map(|id| f(&id)).transpose()?.map(Into::into), 
+                                classes: convert(classes.iter().map(|c| Ok(f(&c)?.into()))).collect()?, 
+                                attrs: convert(attrs.iter().map(|(k,v)| Ok((f(&k)?.into(), v.as_ref().map(|v| f(&v)).transpose()?.map(Into::into))))).collect()?, 
+                            },
+                        pulldown_cmark::Tag::Link { 
+                            link_type, 
+                            dest_url, 
+                            title, 
+                            id 
+                        } => pulldown_cmark::Tag::Link { 
+                            link_type: link_type.clone(),
+                            dest_url: f(&dest_url)?.into(),
+                            title: f(&title)?.into(),
+                            id: f(&id)?.into(),
+                        },
+                        pulldown_cmark::Tag::Image { 
+                            link_type, 
+                            dest_url, 
+                            title, 
+                            id 
+                        } => pulldown_cmark::Tag::Image { 
+                            link_type: link_type.clone(),
+                            dest_url: f(&dest_url)?.into(),
+                            title: f(&title)?.into(),
+                            id: f(&id)?.into(),
+                        },
+                        pulldown_cmark::Tag::DocTag { 
+                            name,
+                            arguments,
+                            argument_delimiters
+                        } => pulldown_cmark::Tag::DocTag { 
+                            name: name.clone(),
+                            arguments: convert(arguments.iter()
+                                .map(|(name,typ,value)| 
+                                    Ok((name.clone(), typ.clone(), f(&value)?.into()))
+                                 )).collect()?,
+                            argument_delimiters: argument_delimiters.clone(),
+                        },
+                        t => t.clone()
+                    }),
+                e => e.clone()
+            })
+        )).collect()?;
+        Ok(Self(events))
     }
 }
 
@@ -126,35 +222,87 @@ impl FromStr for CommonMark {
     type Err = Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(
-            vec![Event::Text(CowStr::from(s).into_static())]
+            vec![Event::Text(pulldown_cmark::CowStr::from(s).into_static())]
         ))
     }
 }
 
 #[derive(Clone, Debug)]
 enum RichTextStorage {
-    CommonMarkEvents(CommonMark)
+    CommonMark(CommonMark)
 }
 
 impl RichTextStorage {
     fn str(text: &str, representation: RichTextRepresentation) -> Self {
         match representation {
             RichTextRepresentation::CommonMark =>
-                Self::CommonMarkEvents(CommonMark::from_str(text).unwrap()),
+                Self::CommonMark(CommonMark::from_str(text).unwrap()),
         }
     }
 
     fn empty(representation: RichTextRepresentation) -> Self {
         match representation {
             RichTextRepresentation::CommonMark =>
-                Self::CommonMarkEvents(CommonMark::default()),
+                Self::CommonMark(CommonMark::default()),
         }
+    }
+
+    fn into_admonition(self, kind: AdmonitionKind) -> Self {
+        match self {
+            Self::CommonMark(events) => {
+                let kind = Some(kind.into());
+                let mut events = events;
+                events.0.insert(
+                    0,
+                    Event::Start(Tag::BlockQuote(kind))
+                );
+                events.0.push(Event::End(pulldown_cmark::TagEnd::BlockQuote(kind)));
+                
+                Self::CommonMark(events)
+            }
+        }
+    }
+
+    pub fn try_map_text<E>(&self, f: impl Fn(&str) -> Result<CowStr<'static>, E>) -> Result<Self, E> {
+        Ok(match self {
+            Self::CommonMark(md) => Self::CommonMark(md.try_map_text(f)?)
+        })
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum RichTextRepresentation {
     CommonMark,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Serialize, Deserialize)]
+pub enum AdmonitionKind {
+    #[strum(serialize = "note")]
+    Note,
+
+    #[strum(serialize = "tip")]
+    Tip,
+
+    #[strum(serialize = "important")]
+    Important,
+
+    #[strum(serialize = "warning")]
+    Warning,
+
+    #[strum(serialize = "caution")]
+    Caution,
+}
+
+impl From<AdmonitionKind> for BlockQuoteKind {
+    fn from(value: AdmonitionKind) -> Self {
+        match value {
+            AdmonitionKind::Caution => Self::Caution,
+            AdmonitionKind::Important => Self::Important,
+            AdmonitionKind::Warning => Self::Warning,
+            AdmonitionKind::Note => Self::Note,
+            AdmonitionKind::Tip => Self::Tip,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,32 +336,50 @@ impl RichText {
     pub fn common_mark(events: CommonMark) -> Self {
         Self {
             dialect: None,
-            storage: RichTextStorage::CommonMarkEvents(events)
+            storage: RichTextStorage::CommonMark(events)
         }
     }
 
-    pub fn link(&self) -> Result<(url::Url, &str), LinkExtractionError> {
+    pub fn link(&self) -> Result<(url::Url, CowStr<'static>), LinkExtractionError> {
         match &self.storage {
-            RichTextStorage::CommonMarkEvents(events) => 
+            RichTextStorage::CommonMark(events) => 
                 events.link()
         }
     }
 
     pub fn str(&self) -> CowStr {
         match &self.storage {
-            RichTextStorage::CommonMarkEvents(common_mark) => return common_mark.str(),
+            RichTextStorage::CommonMark(common_mark) => return common_mark.str(),
         }
     }
 
     pub fn append(&mut self, content: RichText) {
         
     }
+
+    pub fn into_admonition(self, kind: AdmonitionKind) -> Self {
+        Self { 
+            dialect: self.dialect, 
+            storage: self.storage.into_admonition(kind) 
+        }
+    }
+
+    pub fn try_map_text<E>(&self, f: impl Fn(&str) -> Result<CowStr<'static>, E>) -> Result<Self, E> {
+        Ok(Self {
+            storage: self.storage.try_map_text(f)?,
+            dialect: self.dialect
+        })
+    }
+
+    pub fn map_text(&self, f: impl Fn(&str) -> CowStr<'static>) -> Self {
+        self.try_map_text::<Infallible>(|s| Ok(f(s))).unwrap()
+    }
 }
 
 impl ToString for RichText {
     fn to_string(&self) -> String {
         match &self.storage {
-            RichTextStorage::CommonMarkEvents(events) => events.to_string(),
+            RichTextStorage::CommonMark(events) => events.to_string(),
         }
     }
 }
